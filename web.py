@@ -176,6 +176,15 @@ def run_check_silent(
                 else:
                     total_diff_count += 1
                     rtype = "TOTAL_DIFF"
+                other_remarks = {}
+                for col, ev, cv, diff in other_diffs:
+                    if ev != 0 or cv != 0:
+                        search_amt = ev if ev != 0 else cv
+                        hint = _find_similar_billing(
+                            sid, search_amt, all_billings, month_col_labels,
+                        )
+                        if hint:
+                            other_remarks[col] = hint
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -186,6 +195,7 @@ def run_check_silent(
                     csv_total=csv_total,
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
+                    remarks=other_remarks,
                     grade=grades.get(sid, ""),
                 ))
         else:
@@ -512,7 +522,7 @@ HTML_TEMPLATE = """
                         <th>行</th><th>項目</th><th>売上</th>
                         {% for mc in all_month_cols %}<th>{{ mc }}引落</th>{% endfor %}
                         <th>差額</th><th>合計差額</th>
-                        {% if tab_name == 'no_billing' %}<th>備考（類似請求）</th>{% endif %}
+                        <th>備考（類似請求）</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -530,13 +540,11 @@ HTML_TEMPLATE = """
                         {% endfor %}
                         <td class="num {{ 'positive' if r.diff_val > 0 else 'negative' if r.diff_val < 0 else '' }}">{{ r.diff }}</td>
                         <td class="num {{ 'positive' if r.total_diff_val > 0 else 'negative' if r.total_diff_val < 0 else '' }}">{{ r.total_diff }}</td>
-                        {% if tab_name == 'no_billing' %}
                         <td style="font-size:11px; color:#666; white-space:normal; max-width:300px;">{{ r.remark }}</td>
-                        {% endif %}
                     </tr>
                 {% endfor %}
                 {% if not tab_rows %}
-                    <tr><td colspan="{{ (10 if tab_name == 'no_billing' else 9) + all_month_cols|length }}" class="empty">該当なし</td></tr>
+                    <tr><td colspan="{{ 10 + all_month_cols|length }}" class="empty">該当なし</td></tr>
                 {% endif %}
                 </tbody>
             </table>

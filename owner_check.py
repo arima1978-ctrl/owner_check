@@ -691,23 +691,33 @@ def _compute_monthly_billing(
 
 def _find_similar_billing(
     sid: str,
-    excel_amount: float,
+    search_amount: float,
     all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
     month_col_labels: list[str],
 ) -> str:
     """
-    売上あり請求なしの項目について、前後月の全請求から
+    差異がある項目について、前後月の全請求から
     同額または近い金額の請求を探してコメントを返す。
     """
+    if search_amount == 0:
+        return ""
     hints = []
+    seen = set()
     for label in month_col_labels:
         billing = all_billings.get(label, {})
         entries = billing.get(sid, [])
         for brand, category, amount in entries:
-            if abs(amount - excel_amount) < 1 and amount != 0:
+            if amount == 0:
+                continue
+            key = (label, brand, category, amount)
+            if key in seen:
+                continue
+            if abs(amount - search_amount) < 1:
                 hints.append(f"{label}「{brand}/{category}」{amount:,.0f}")
-            elif abs(amount) >= abs(excel_amount) * 0.5 and abs(amount - excel_amount) < abs(excel_amount) * 0.3 and amount != 0:
+                seen.add(key)
+            elif abs(search_amount) > 0 and abs(amount - search_amount) < abs(search_amount) * 0.3:
                 hints.append(f"{label}「{brand}/{category}」{amount:,.0f}(近似)")
+                seen.add(key)
     if hints:
         return " / ".join(hints[:3])
     return ""
@@ -859,6 +869,16 @@ def run_check(
                 else:
                     total_diff_count += 1
                     rtype = "TOTAL_DIFF"
+                # 備考: 差異がある項目について類似請求を探す
+                other_remarks = {}
+                for col, ev, cv, diff in other_diffs:
+                    if ev != 0 or cv != 0:
+                        search_amt = ev if ev != 0 else cv
+                        hint = _find_similar_billing(
+                            sid, search_amt, all_billings, month_col_labels,
+                        )
+                        if hint:
+                            other_remarks[col] = hint
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -869,6 +889,7 @@ def run_check(
                     csv_total=csv_total,
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
+                    remarks=other_remarks,
                     grade=grades.get(sid, ""),
                 ))
             elif not unbilled_diffs:
