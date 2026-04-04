@@ -31,6 +31,7 @@ from owner_check import (
     _load_billing_by_priority,
     _get_adjacent_months,
     _find_nearest_class_info,
+    _preload_all_billings,
     _compute_monthly_billing,
     read_excel_sales,
     aggregate_csv_for_student,
@@ -63,6 +64,7 @@ def run_check_silent(
     sales = read_excel_sales(excel_path, sheet_index)
 
     month_col_labels = [label for _, label in csv_paths_with_labels]
+    all_billings = _preload_all_billings(csv_paths_with_labels)
 
     ok_count = 0
     col_only_count = 0
@@ -104,22 +106,23 @@ def run_check_silent(
             csv_total = sum(csv_agg.values())
             total_match = abs(excel_total - csv_total) < 1
 
-            # 売上あり・請求なし判定
-            is_no_billing = csv_total == 0 and excel_total > 0
-
-            if is_no_billing:
-                no_billing_count += 1
-            elif total_match:
-                col_only_count += 1
-            else:
-                total_diff_count += 1
-
-            rtype = "NO_BILLING" if is_no_billing else (
-                "TOTAL_MATCH" if total_match else "TOTAL_DIFF"
+            # 売上あり請求なし: 差異のうち Excel>0 かつ CSV=0 の項目があるか
+            has_unbilled = any(
+                ev > 0 and cv == 0 for _, ev, cv, _ in diffs
             )
 
-            _, monthly = _compute_monthly_billing(
-                sid, csv_paths_with_labels, school_brands,
+            if has_unbilled:
+                no_billing_count += 1
+                rtype = "NO_BILLING"
+            elif total_match:
+                col_only_count += 1
+                rtype = "TOTAL_MATCH"
+            else:
+                total_diff_count += 1
+                rtype = "TOTAL_DIFF"
+
+            monthly = _compute_monthly_billing(
+                sid, all_billings, month_col_labels, school_brands,
             )
 
             results.append(CheckResult(
@@ -235,7 +238,7 @@ def results_to_csv_bytes(results: list[CheckResult]) -> bytes:
 
     for r in results:
         if r.result_type == "NOT_IN_CSV":
-            row_data = [r.school, r.month_label, "★要確認", "CSV未登録",
+            row_data = [r.school, r.month_label, "★要確認", "月謝未計上",
                         r.sid, r.name, r.row, "売上合計", r.excel_total]
             row_data.extend([0] * len(all_month_cols))
             row_data.extend([r.excel_total, r.excel_total])
@@ -401,7 +404,7 @@ HTML_TEMPLATE = """
                     <span class="value nobill">{{ s.no_billing }}人</span>
                 </div>
                 <div class="summary-row">
-                    <span class="label">CSV未登録</span>
+                    <span class="label">月謝未計上</span>
                     <span class="value">{{ s.not_in_csv }}人</span>
                 </div>
             </div>
@@ -431,7 +434,7 @@ HTML_TEMPLATE = """
                 売上あり請求なし（{{ count_no_billing }}件）
             </button>
             <button class="tab" onclick="showTab('not_csv', this)" style="color:#7f8c8d">
-                CSV未登録（{{ count_not_csv }}件）
+                月謝未計上（{{ count_not_csv }}件）
             </button>
             <button class="tab" onclick="showTab('col_only', this)" style="color:#e67e22">
                 列配分違い（{{ count_col_only }}件）

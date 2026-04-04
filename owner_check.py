@@ -580,21 +580,33 @@ def _get_adjacent_months(
     return months
 
 
+def _preload_all_billings(
+    csv_paths_with_labels: list[tuple[str, str]],
+) -> dict[str, dict[str, list[tuple[str, str, float]]]]:
+    """
+    全月のCSVを一括読み込み。
+    返り値: {月ラベル: {生徒ID: [(ブランド名, カテゴリ名, 月額料金), ...]}}
+    """
+    all_billings: dict[str, dict[str, list[tuple[str, str, float]]]] = {}
+    for path, label in csv_paths_with_labels:
+        all_billings[label] = read_billing_csv(path)
+    return all_billings
+
+
 def _compute_monthly_billing(
     sid: str,
-    csv_paths_with_labels: list[tuple[str, str]],
+    all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
+    month_col_labels: list[str],
     school_brands: dict[str, set[str]] | None,
-) -> tuple[list[str], dict[str, dict[str, float]]]:
+) -> dict[str, dict[str, float]]:
     """
-    生徒1人の各月別引落額を計算。
-    返り値: (月ラベルリスト, {月ラベル: {列レター: 金額}})
+    事前読み込み済みのデータから生徒1人の各月別引落額を計算。
+    返り値: {月ラベル: {列レター: 金額}}
     """
-    month_labels = []
     monthly: dict[str, dict[str, float]] = {}
 
-    for path, label in csv_paths_with_labels:
-        month_labels.append(label)
-        billing = read_billing_csv(path)
+    for label in month_col_labels:
+        billing = all_billings.get(label, {})
         entries = billing.get(sid, [])
         if school_brands is not None:
             student_brands = school_brands.get(sid)
@@ -602,7 +614,7 @@ def _compute_monthly_billing(
         agg = aggregate_csv_for_student(entries)
         monthly[label] = agg
 
-    return month_labels, monthly
+    return monthly
 
 
 def run_check(
@@ -635,10 +647,14 @@ def run_check(
 
     month_col_labels = [label for _, label in csv_paths_with_labels]
 
+    # 月別引落額計算用: 全CSVを事前に一括読み込み
+    all_billings = _preload_all_billings(csv_paths_with_labels)
+
     ok_count = 0
     col_only_count = 0
     total_diff_count = 0
     not_in_csv_count = 0
+    no_billing_count = 0
     results: list[CheckResult] = []
 
     for sid, sdata in sorted(sales.items(), key=lambda x: x[1]["row"]):
@@ -676,20 +692,30 @@ def run_check(
             csv_total = sum(csv_agg.values())
             total_match = abs(excel_total - csv_total) < 1
 
-            if total_match:
+            # 売上あり請求なし: 差異のうち Excel>0 かつ CSV=0 の項目があるか
+            has_unbilled = any(
+                ev > 0 and cv == 0 for _, ev, cv, _ in diffs
+            )
+
+            if has_unbilled:
+                no_billing_count += 1
+                rtype = "NO_BILLING"
+            elif total_match:
                 col_only_count += 1
+                rtype = "TOTAL_MATCH"
             else:
                 total_diff_count += 1
+                rtype = "TOTAL_DIFF"
 
-            # 各月別の引落額を計算
-            _, monthly = _compute_monthly_billing(
-                sid, csv_paths_with_labels, school_brands,
+            # 各月別の引落額を計算（事前読み込み済みデータを使用）
+            monthly = _compute_monthly_billing(
+                sid, all_billings, month_col_labels, school_brands,
             )
 
             results.append(CheckResult(
                 school=school_name,
                 month_label=month_label,
-                result_type="TOTAL_MATCH" if total_match else "TOTAL_DIFF",
+                result_type=rtype,
                 sid=sid,
                 name=name,
                 row=row_num,
@@ -708,7 +734,8 @@ def run_check(
     print(f"  完全一致 (OK):     {ok_count}")
     print(f"  列配分違い(合計一致): {col_only_count}")
     print(f"  合計不一致(要確認):  {total_diff_count}")
-    print(f"  CSV未登録:         {not_in_csv_count}")
+    print(f"  売上あり請求なし:    {no_billing_count}")
+    print(f"  月謝未計上:        {not_in_csv_count}")
 
     _print_details(results)
 
@@ -741,7 +768,7 @@ def _print_details(results: list[CheckResult]) -> None:
 
     if not_in_csv:
         print(f"\n{'─'*80}")
-        print(f"  CSV未登録: {len(not_in_csv)}件")
+        print(f"  月謝未計上: {len(not_in_csv)}件")
         print(f"{'─'*80}")
         for r in not_in_csv:
             print(f"  生徒ID={r.sid} {r.name} "
@@ -793,7 +820,7 @@ def write_results_csv(
         for r in all_results:
             if r.result_type == "NOT_IN_CSV":
                 row_data = [
-                    r.school, r.month_label, "★要確認", "CSV未登録",
+                    r.school, r.month_label, "★要確認", "月謝未計上",
                     r.sid, r.name, r.row, "売上合計",
                     r.excel_total,
                 ]
@@ -946,7 +973,7 @@ def main():
         col_only = sum(1 for r in school_results if r.result_type == "TOTAL_MATCH")
         not_csv = sum(1 for r in school_results if r.result_type == "NOT_IN_CSV")
         print(f"  {sn}: 合計不一致={critical}件, "
-              f"列配分違い={col_only}件, CSV未登録={not_csv}件")
+              f"列配分違い={col_only}件, 月謝未計上={not_csv}件")
 
     print(f"\n■ 照合結果CSVを出力しました: {output_path}")
     print()
