@@ -409,12 +409,8 @@ HTML_TEMPLATE = """
                     <span class="value ok">{{ s.ok }}人</span>
                 </div>
                 <div class="summary-row">
-                    <span class="label">列配分違い（合計一致）</span>
+                    <span class="label">その他の差異</span>
                     <span class="value warn">{{ s.col_only }}人</span>
-                </div>
-                <div class="summary-row">
-                    <span class="label">合計不一致（要確認）</span>
-                    <span class="value critical">{{ s.total_diff }}人</span>
                 </div>
                 <div class="summary-row">
                     <span class="label">売上あり請求なし</span>
@@ -444,23 +440,19 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="tabs">
-            <button class="tab active" id="tab-critical" data-tab="critical" onclick="showTab('critical', this)" style="color:#e74c3c">
-                合計不一致（<span class="tab-count">{{ count_critical }}</span>件）
-            </button>
-            <button class="tab" id="tab-no_billing" data-tab="no_billing" onclick="showTab('no_billing', this)" style="color:#8e44ad">
+            <button class="tab active" id="tab-no_billing" data-tab="no_billing" onclick="showTab('no_billing', this)" style="color:#8e44ad">
                 売上あり請求なし（<span class="tab-count">{{ count_no_billing }}</span>件）
             </button>
             <button class="tab" id="tab-not_csv" data-tab="not_csv" onclick="showTab('not_csv', this)" style="color:#7f8c8d">
                 月謝未計上（<span class="tab-count">{{ count_not_csv }}</span>件）
             </button>
             <button class="tab" id="tab-col_only" data-tab="col_only" onclick="showTab('col_only', this)" style="color:#e67e22">
-                列配分違い（<span class="tab-count">{{ count_col_only }}</span>件）
+                その他の差異（<span class="tab-count">{{ count_col_only }}</span>件）
             </button>
         </div>
 
         <div class="table-wrap">
             {% for tab_name, tab_rows, tab_type in [
-                ('critical', critical_rows, 'full'),
                 ('no_billing', no_billing_rows, 'full'),
                 ('col_only', col_only_rows, 'full'),
             ] %}
@@ -540,7 +532,7 @@ HTML_TEMPLATE = """
         const month = document.getElementById('filterMonth').value;
 
         // 全テーブルにフィルタ適用 & 件数カウント
-        const tabNames = ['critical', 'no_billing', 'not_csv', 'col_only'];
+        const tabNames = ['no_billing', 'not_csv', 'col_only'];
         tabNames.forEach(function(name) {
             const table = document.getElementById('table-' + name);
             if (!table) return;
@@ -710,7 +702,6 @@ def _build_template_data() -> dict:
             if mc not in all_month_cols:
                 all_month_cols.append(mc)
 
-    critical_rows = []
     no_billing_rows = []
     not_csv_rows = []
     col_only_rows = []
@@ -730,10 +721,8 @@ def _build_template_data() -> dict:
 
             if r.result_type == "NO_BILLING":
                 target = no_billing_rows
-            elif r.result_type == "TOTAL_MATCH":
-                target = col_only_rows
             else:
-                target = critical_rows
+                target = col_only_rows
 
             for col, ev, cv, diff in r.diffs:
                 target.append(
@@ -748,11 +737,9 @@ def _build_template_data() -> dict:
         "summaries": summaries,
         "timestamp": timestamp,
         "all_month_cols": all_month_cols,
-        "critical_rows": critical_rows,
         "no_billing_rows": no_billing_rows,
         "not_csv_rows": not_csv_rows,
         "col_only_rows": col_only_rows,
-        "count_critical": len(critical_rows),
         "count_no_billing": len(no_billing_rows),
         "count_not_csv": len(not_csv_rows),
         "count_col_only": len(col_only_rows),
