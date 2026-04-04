@@ -81,26 +81,6 @@ class CheckResult:
 #   X=入会金, Y=その他, Z=売上合計
 # ====================================================================
 
-JUKU_BRANDS = {
-    "アン進学ジム【小学部】",
-    "アン進学ジム【中学部】",
-    "アン進学ジム【高校部】",
-    "SEEDS 小学部",
-    "SEEDS 中学部",
-    "SEEDS 高校部",
-    "SEEDS Lepton",
-    "星煌学院本科",
-    "千種校　中学受験コース",
-    "小学生選抜クラス",
-    "小学生学力向上コース",
-    "中学生選抜コース",
-    "志望校合格コース",
-    "英検対策",
-    "アンさんこくキッズ",
-    "マンツーマン学院",
-    "メプレス",
-    "須田塾 高校部",
-}
 
 BRAND_COLUMN_MAP = {
     "アンイングリッシュクラブ": ("M", "N"),
@@ -501,18 +481,13 @@ def _map_to_column(brand: str, category: str) -> str | None:
             return "I"
         return "Y"
 
-    if brand in JUKU_BRANDS:
-        if category in ("授業料", "追加授業料"):
-            return "E"
-        if category == "月会費":
-            return "F"
-        if category in ("講習会費", "必須講座", "必須講習会", "テスト対策"):
-            return "I"
-        return "Y"
-
-    if "そろばん検定" in brand:
-        return "Y"
-
+    # 上記BRAND_COLUMN_MAP以外のブランドは全て学習塾として扱う
+    if category in ("授業料", "追加授業料"):
+        return "E"
+    if category == "月会費":
+        return "F"
+    if category in ("講習会費", "必須講座", "必須講習会", "テスト対策"):
+        return "I"
     return "Y"
 
 
