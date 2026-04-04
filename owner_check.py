@@ -65,6 +65,8 @@ class CheckResult:
     csv_total: float = 0.0
     # 前後月の引落額: {月ラベル: {列レター: 金額}}
     monthly_billing: dict = field(default_factory=dict)
+    # 備考: {列レター: コメント文字列}
+    remarks: dict = field(default_factory=dict)
     # 対象月の前後月ラベルリスト（表示順）
     month_columns: list = field(default_factory=list)
 
@@ -666,6 +668,30 @@ def _compute_monthly_billing(
     return monthly
 
 
+def _find_similar_billing(
+    sid: str,
+    excel_amount: float,
+    all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
+    month_col_labels: list[str],
+) -> str:
+    """
+    売上あり請求なしの項目について、前後月の全請求から
+    同額または近い金額の請求を探してコメントを返す。
+    """
+    hints = []
+    for label in month_col_labels:
+        billing = all_billings.get(label, {})
+        entries = billing.get(sid, [])
+        for brand, category, amount in entries:
+            if abs(amount - excel_amount) < 1 and amount != 0:
+                hints.append(f"{label}「{brand}/{category}」{amount:,.0f}")
+            elif abs(amount) >= abs(excel_amount) * 0.5 and abs(amount - excel_amount) < abs(excel_amount) * 0.3 and amount != 0:
+                hints.append(f"{label}「{brand}/{category}」{amount:,.0f}(近似)")
+    if hints:
+        return " / ".join(hints[:3])
+    return ""
+
+
 def run_check(
     school_name: str,
     month_label: str,
@@ -781,6 +807,14 @@ def run_check(
 
             if unbilled_diffs:
                 no_billing_count += 1
+                # 備考: 前後月で同額/近似額の請求を探す
+                remarks = {}
+                for col, ev, cv, diff in unbilled_diffs:
+                    hint = _find_similar_billing(
+                        sid, ev, all_billings, month_col_labels,
+                    )
+                    if hint:
+                        remarks[col] = hint
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -791,6 +825,7 @@ def run_check(
                     csv_total=csv_total,
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
+                    remarks=remarks,
                 ))
 
             if other_diffs:

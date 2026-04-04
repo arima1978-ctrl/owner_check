@@ -34,6 +34,7 @@ from owner_check import (
     _find_nearest_class_info,
     _preload_all_billings,
     _compute_monthly_billing,
+    _find_similar_billing,
     read_excel_sales,
     aggregate_csv_for_student,
     compare_student,
@@ -144,6 +145,13 @@ def run_check_silent(
 
             if unbilled_diffs:
                 no_billing_count += 1
+                remarks = {}
+                for col, ev, cv, diff in unbilled_diffs:
+                    hint = _find_similar_billing(
+                        sid, ev, all_billings, month_col_labels,
+                    )
+                    if hint:
+                        remarks[col] = hint
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -154,6 +162,7 @@ def run_check_silent(
                     csv_total=csv_total,
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
+                    remarks=remarks,
                 ))
 
             if other_diffs:
@@ -498,6 +507,7 @@ HTML_TEMPLATE = """
                         <th>行</th><th>項目</th><th>売上</th>
                         {% for mc in all_month_cols %}<th>{{ mc }}引落</th>{% endfor %}
                         <th>差額</th><th>合計差額</th>
+                        {% if tab_name == 'no_billing' %}<th>備考（類似請求）</th>{% endif %}
                     </tr>
                 </thead>
                 <tbody>
@@ -515,10 +525,13 @@ HTML_TEMPLATE = """
                         {% endfor %}
                         <td class="num {{ 'positive' if r.diff_val > 0 else 'negative' if r.diff_val < 0 else '' }}">{{ r.diff }}</td>
                         <td class="num {{ 'positive' if r.total_diff_val > 0 else 'negative' if r.total_diff_val < 0 else '' }}">{{ r.total_diff }}</td>
+                        {% if tab_name == 'no_billing' %}
+                        <td style="font-size:11px; color:#666; white-space:normal; max-width:300px;">{{ r.remark }}</td>
+                        {% endif %}
                     </tr>
                 {% endfor %}
                 {% if not tab_rows %}
-                    <tr><td colspan="{{ 9 + all_month_cols|length }}" class="empty">該当なし</td></tr>
+                    <tr><td colspan="{{ (10 if tab_name == 'no_billing' else 9) + all_month_cols|length }}" class="empty">該当なし</td></tr>
                 {% endif %}
                 </tbody>
             </table>
@@ -795,6 +808,7 @@ def _build_row(r, col, ev, cv, diff, total_diff, all_month_cols):
         "diff_val": diff,
         "total_diff": _format_number(total_diff),
         "total_diff_val": total_diff,
+        "remark": r.remarks.get(col, "") if hasattr(r, "remarks") else "",
     }
 
 
