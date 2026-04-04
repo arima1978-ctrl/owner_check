@@ -698,14 +698,14 @@ def run_check(
             )
 
             # 項目レベルで「売上あり請求なし」と「その他の差異」を分離
-            # Y列（その他）は売上あり請求なしの対象外
+            # 売上>0 かつ 請求額と不一致 → 売上あり請求なし（Y列は対象外）
             unbilled_diffs = [
                 d for d in diffs
-                if d[1] > 0 and d[2] == 0 and d[0] != "Y"
+                if d[1] > 0 and d[0] != "Y"
             ]
             other_diffs = [
                 d for d in diffs
-                if not (d[1] > 0 and d[2] == 0 and d[0] != "Y")
+                if not (d[1] > 0 and d[0] != "Y")
             ]
 
             if unbilled_diffs:
