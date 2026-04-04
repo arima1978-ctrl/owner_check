@@ -1,0 +1,24 @@
+# 売上照合チェック 設定ファイル
+#
+# 新しい校舎を追加するには schools: に項目を追加するだけ。
+# Excel列構造（D〜Z）が同じであれば、コード変更は不要。
+
+# 請求CSV格納ディレクトリ（全校舎共通）
+csv_base_dir: "Y:/_★20170701作業用/100 真由美/野田より/◆日にち別お仕事◆"
+
+# 照合結果の出力先ディレクトリ
+output_dir: "C:/Users/USER/Documents/照合結果"
+
+# 校舎定義
+schools:
+  - name: "小幡"
+    excel_dir: "C:/Users/USER/Documents/小幡売上"
+    # {name} = 校舎名, {year} = 西暦4桁, {month} = 月2桁
+    excel_pattern: "{name}売上明細書({year}.{month}).xlsm"
+    sheet_index: 2  # 売上明細シート（0始まり）
+
+  # --- 新しい校舎の追加例 ---
+  # - name: "千種"
+  #   excel_dir: "C:/Users/USER/Documents/千種売上"
+  #   excel_pattern: "{name}売上明細書({year}.{month}).xlsm"
+  #   sheet_index: 2
