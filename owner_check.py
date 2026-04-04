@@ -310,6 +310,73 @@ def read_class_info(
     return sid_brands
 
 
+def read_withdrawn_students(
+    class_info_path: str,
+    school_keywords: tuple[str, ...],
+    target_year: int,
+    target_month: int,
+) -> set[str]:
+    """
+    対象月の初日時点で既に退会済みの生徒IDを返す。
+    退会日 < 対象月の初日 → 退会者とみなす。
+    """
+    from datetime import date
+
+    target_first = date(target_year, target_month, 1)
+
+    wb = openpyxl.load_workbook(class_info_path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    # 生徒ごとに全校舎・全ブランドの退会日を集める
+    # この校舎のクラスが全て退会済みなら退会者とみなす
+    sid_classes: dict[str, list[tuple[bool, bool]]] = {}  # {sid: [(is_this_school, is_withdrawn)]}
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=False):
+        sid_val = row[6].value   # G=生徒ID
+        school = row[31].value   # AF=校舎名
+        taikai = row[21].value   # V=退会日
+
+        if sid_val is None or school is None:
+            continue
+
+        sid = str(int(sid_val)) if isinstance(sid_val, (int, float)) else str(sid_val)
+        school_str = str(school)
+
+        is_this_school = any(kw in school_str for kw in school_keywords)
+        if not is_this_school:
+            continue
+
+        # 退会日の判定
+        is_withdrawn = False
+        if taikai is not None:
+            try:
+                if hasattr(taikai, "date"):
+                    taikai_date = taikai.date()
+                elif hasattr(taikai, "year"):
+                    taikai_date = taikai
+                else:
+                    taikai_date = datetime.strptime(
+                        str(taikai).split()[0], "%Y-%m-%d"
+                    ).date()
+                is_withdrawn = taikai_date < target_first
+            except (ValueError, AttributeError):
+                pass
+
+        if sid not in sid_classes:
+            sid_classes[sid] = []
+        sid_classes[sid].append(is_withdrawn)
+
+    wb.close()
+
+    # この校舎の全クラスが退会済みの生徒
+    withdrawn = set()
+    for sid, classes in sid_classes.items():
+        if classes and all(classes):
+            withdrawn.add(sid)
+
+    return withdrawn
+
+
 def filter_billing_by_school(
     billing_entries: list[tuple[str, str, float]],
     school_brands: set[str] | None,
@@ -625,6 +692,7 @@ def run_check(
     excel_path: str,
     sheet_index: int = 2,
     school_brands: dict[str, set[str]] | None = None,
+    withdrawn_sids: set[str] | None = None,
 ) -> list[CheckResult]:
     """
     1校舎・1ヶ月分のチェックを実行。
@@ -655,12 +723,33 @@ def run_check(
     total_diff_count = 0
     not_in_csv_count = 0
     no_billing_count = 0
+    withdrawn_count = 0
     results: list[CheckResult] = []
+
+    _withdrawn = withdrawn_sids or set()
 
     for sid, sdata in sorted(sales.items(), key=lambda x: x[1]["row"]):
         name = sdata["name"]
         excel_cols = sdata["cols"]
         row_num = sdata["row"]
+
+        # 退会者なのに売上がある
+        excel_total_raw = excel_cols.get("Z", 0)
+        if isinstance(excel_total_raw, str):
+            excel_total_raw = 0
+        if sid in _withdrawn and excel_total_raw > 0:
+            withdrawn_count += 1
+            results.append(CheckResult(
+                school=school_name,
+                month_label=month_label,
+                result_type="WITHDRAWN",
+                sid=sid,
+                name=name,
+                row=row_num,
+                excel_total=excel_total_raw,
+                month_columns=month_col_labels,
+            ))
+            continue
 
         if sid not in billing:
             total = excel_cols.get("Z", 0)
@@ -753,6 +842,7 @@ def run_check(
     print(f"  列配分違い(合計一致): {col_only_count}")
     print(f"  合計不一致(要確認):  {total_diff_count}")
     print(f"  売上あり請求なし:    {no_billing_count}")
+    print(f"  退会者売上あり:     {withdrawn_count}")
     print(f"  月謝未計上:        {not_in_csv_count}")
 
     _print_details(results)
@@ -953,8 +1043,9 @@ def main():
                         (csv_files[ym], f"{ym[0]}年{ym[1]}月")
                     )
 
-            # クラス情報から校舎別ブランドフィルタを構築
+            # クラス情報から校舎別ブランドフィルタ＋退会者リストを構築
             school_brands = None
+            withdrawn_sids = None
             if school.school_keywords and class_info_files:
                 best_ci = _find_nearest_class_info(
                     pair.year, pair.month, class_info_files,
@@ -962,6 +1053,10 @@ def main():
                 if best_ci:
                     school_brands = read_class_info(
                         best_ci, school.school_keywords,
+                    )
+                    withdrawn_sids = read_withdrawn_students(
+                        best_ci, school.school_keywords,
+                        pair.year, pair.month,
                     )
 
             results = run_check(
@@ -972,6 +1067,7 @@ def main():
                 excel_path=pair.excel_path,
                 sheet_index=school.sheet_index,
                 school_brands=school_brands,
+                withdrawn_sids=withdrawn_sids,
             )
             all_results.extend(results)
 

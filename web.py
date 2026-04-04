@@ -27,6 +27,7 @@ from owner_check import (
     discover_class_info_files,
     match_months,
     read_class_info,
+    read_withdrawn_students,
     filter_billing_by_school,
     _load_billing_by_priority,
     _get_adjacent_months,
@@ -58,6 +59,7 @@ def run_check_silent(
     excel_path: str,
     sheet_index: int = 2,
     school_brands: dict[str, set[str]] | None = None,
+    withdrawn_sids: set[str] | None = None,
 ) -> tuple[list[CheckResult], dict]:
     """コンソール出力なしで照合チェック"""
     billing = _load_billing_by_priority(csv_paths)
@@ -71,12 +73,31 @@ def run_check_silent(
     total_diff_count = 0
     not_in_csv_count = 0
     no_billing_count = 0
+    withdrawn_count = 0
     results: list[CheckResult] = []
+
+    _withdrawn = withdrawn_sids or set()
 
     for sid, sdata in sorted(sales.items(), key=lambda x: x[1]["row"]):
         name = sdata["name"]
         excel_cols = sdata["cols"]
         row_num = sdata["row"]
+
+        # 退会者なのに売上がある
+        excel_total_raw = excel_cols.get("Z", 0)
+        if isinstance(excel_total_raw, str):
+            excel_total_raw = 0
+        if sid in _withdrawn and excel_total_raw > 0:
+            withdrawn_count += 1
+            results.append(CheckResult(
+                school=school_name,
+                month_label=month_label,
+                result_type="WITHDRAWN",
+                sid=sid, name=name, row=row_num,
+                excel_total=excel_total_raw,
+                month_columns=month_col_labels,
+            ))
+            continue
 
         if sid not in billing:
             total = excel_cols.get("Z", 0)
@@ -163,6 +184,7 @@ def run_check_silent(
         "total_diff": total_diff_count,
         "not_in_csv": not_in_csv_count,
         "no_billing": no_billing_count,
+        "withdrawn": withdrawn_count,
     }
 
     return results, summary
@@ -208,6 +230,7 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                     )
 
             school_brands = None
+            withdrawn_sids = None
             if school.school_keywords and class_info_files:
                 best_ci = _find_nearest_class_info(
                     pair.year, pair.month, class_info_files,
@@ -215,6 +238,10 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                 if best_ci:
                     school_brands = read_class_info(
                         best_ci, school.school_keywords,
+                    )
+                    withdrawn_sids = read_withdrawn_students(
+                        best_ci, school.school_keywords,
+                        pair.year, pair.month,
                     )
 
             results, summary = run_check_silent(
@@ -225,6 +252,7 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                 excel_path=pair.excel_path,
                 sheet_index=school.sheet_index,
                 school_brands=school_brands,
+                withdrawn_sids=withdrawn_sids,
             )
             all_results.extend(results)
             all_summaries.append({
@@ -417,6 +445,10 @@ HTML_TEMPLATE = """
                     <span class="value nobill">{{ s.no_billing }}人</span>
                 </div>
                 <div class="summary-row">
+                    <span class="label">退会者売上あり</span>
+                    <span class="value critical">{{ s.withdrawn }}人</span>
+                </div>
+                <div class="summary-row">
                     <span class="label">月謝未計上</span>
                     <span class="value">{{ s.not_in_csv }}人</span>
                 </div>
@@ -442,6 +474,9 @@ HTML_TEMPLATE = """
         <div class="tabs">
             <button class="tab active" id="tab-no_billing" data-tab="no_billing" onclick="showTab('no_billing', this)" style="color:#8e44ad">
                 売上あり請求なし（<span class="tab-count">{{ count_no_billing }}</span>件）
+            </button>
+            <button class="tab" id="tab-withdrawn" data-tab="withdrawn" onclick="showTab('withdrawn', this)" style="color:#c0392b">
+                退会者売上あり（<span class="tab-count">{{ count_withdrawn }}</span>件）
             </button>
             <button class="tab" id="tab-not_csv" data-tab="not_csv" onclick="showTab('not_csv', this)" style="color:#7f8c8d">
                 月謝未計上（<span class="tab-count">{{ count_not_csv }}</span>件）
@@ -489,6 +524,28 @@ HTML_TEMPLATE = """
             </table>
             {% endfor %}
 
+            <table id="table-withdrawn" style="display:none;">
+                <thead>
+                    <tr>
+                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
+                        <th>行</th><th>売上</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for r in withdrawn_rows %}
+                    <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
+                        <td>{{ r.school }}</td><td>{{ r.month }}</td>
+                        <td>{{ r.sid }}</td><td>{{ r.name }}</td>
+                        <td class="num">{{ r.row }}</td>
+                        <td class="num">{{ r.excel }}</td>
+                    </tr>
+                {% endfor %}
+                {% if not withdrawn_rows %}
+                    <tr><td colspan="6" class="empty">該当なし</td></tr>
+                {% endif %}
+                </tbody>
+            </table>
+
             <table id="table-not_csv" style="display:none;">
                 <thead>
                     <tr>
@@ -532,7 +589,7 @@ HTML_TEMPLATE = """
         const month = document.getElementById('filterMonth').value;
 
         // 全テーブルにフィルタ適用 & 件数カウント
-        const tabNames = ['no_billing', 'not_csv', 'col_only'];
+        const tabNames = ['no_billing', 'withdrawn', 'not_csv', 'col_only'];
         tabNames.forEach(function(name) {
             const table = document.getElementById('table-' + name);
             if (!table) return;
@@ -758,11 +815,21 @@ def _build_template_data() -> dict:
                 all_month_cols.append(mc)
 
     no_billing_rows = []
+    withdrawn_rows = []
     not_csv_rows = []
     col_only_rows = []
 
     for r in results:
-        if r.result_type == "NOT_IN_CSV":
+        if r.result_type == "WITHDRAWN":
+            withdrawn_rows.append({
+                "school": r.school,
+                "month": r.month_label,
+                "sid": r.sid,
+                "name": r.name,
+                "row": r.row,
+                "excel": _format_number(r.excel_total),
+            })
+        elif r.result_type == "NOT_IN_CSV":
             not_csv_rows.append({
                 "school": r.school,
                 "month": r.month_label,
@@ -793,9 +860,11 @@ def _build_template_data() -> dict:
         "timestamp": timestamp,
         "all_month_cols": all_month_cols,
         "no_billing_rows": no_billing_rows,
+        "withdrawn_rows": withdrawn_rows,
         "not_csv_rows": not_csv_rows,
         "col_only_rows": col_only_rows,
         "count_no_billing": len(no_billing_rows),
+        "count_withdrawn": len(withdrawn_rows),
         "count_not_csv": len(not_csv_rows),
         "count_col_only": len(col_only_rows),
         "school_names": school_names,
