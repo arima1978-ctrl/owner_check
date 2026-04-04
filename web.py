@@ -151,7 +151,7 @@ def run_check_silent(
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
                     hint = _find_similar_billing(
-                        sid, ev, all_billings, month_col_labels,
+                        sid, ev, all_billings, month_col_labels, col,
                     )
                     if hint:
                         remarks[col] = hint
@@ -181,7 +181,7 @@ def run_check_silent(
                     if ev != 0 or cv != 0:
                         search_amt = ev if ev != 0 else cv
                         hint = _find_similar_billing(
-                            sid, search_amt, all_billings, month_col_labels,
+                            sid, search_amt, all_billings, month_col_labels, col,
                         )
                         if hint:
                             other_remarks[col] = hint

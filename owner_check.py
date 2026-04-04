@@ -694,13 +694,24 @@ def _find_similar_billing(
     search_amount: float,
     all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
     month_col_labels: list[str],
+    target_col: str = "",
 ) -> str:
     """
     差異がある項目について、前後月の全請求から
     同額または近い金額の請求を探してコメントを返す。
+    target_col が指定された場合、そのExcel列にマッピングされるブランドの請求は除外する
+    （既にマッピング済みのため）。
     """
     if search_amount == 0:
         return ""
+
+    # target_colにマッピングされるブランドを特定（除外対象）
+    exclude_brands = set()
+    if target_col:
+        for brand, (jcol, mcol) in BRAND_COLUMN_MAP.items():
+            if jcol == target_col or mcol == target_col:
+                exclude_brands.add(brand)
+
     hints = []
     seen = set()
     for label in month_col_labels:
@@ -708,6 +719,9 @@ def _find_similar_billing(
         entries = billing.get(sid, [])
         for brand, category, amount in entries:
             if amount == 0:
+                continue
+            # 既にマッピング済みのブランドはスキップ
+            if brand in exclude_brands:
                 continue
             key = (label, brand, category, amount)
             if key in seen:
@@ -844,7 +858,7 @@ def run_check(
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
                     hint = _find_similar_billing(
-                        sid, ev, all_billings, month_col_labels,
+                        sid, ev, all_billings, month_col_labels, col,
                     )
                     if hint:
                         remarks[col] = hint
@@ -875,7 +889,7 @@ def run_check(
                     if ev != 0 or cv != 0:
                         search_amt = ev if ev != 0 else cv
                         hint = _find_similar_billing(
-                            sid, search_amt, all_billings, month_col_labels,
+                            sid, search_amt, all_billings, month_col_labels, col,
                         )
                         if hint:
                             other_remarks[col] = hint
