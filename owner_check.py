@@ -63,6 +63,10 @@ class CheckResult:
     diffs: list = field(default_factory=list)
     excel_total: float = 0.0
     csv_total: float = 0.0
+    # 前後月の引落額: {月ラベル: {列レター: 金額}}
+    monthly_billing: dict = field(default_factory=dict)
+    # 対象月の前後月ラベルリスト（表示順）
+    month_columns: list = field(default_factory=list)
 
 
 # ====================================================================
@@ -576,17 +580,44 @@ def _get_adjacent_months(
     return months
 
 
+def _compute_monthly_billing(
+    sid: str,
+    csv_paths_with_labels: list[tuple[str, str]],
+    school_brands: dict[str, set[str]] | None,
+) -> tuple[list[str], dict[str, dict[str, float]]]:
+    """
+    生徒1人の各月別引落額を計算。
+    返り値: (月ラベルリスト, {月ラベル: {列レター: 金額}})
+    """
+    month_labels = []
+    monthly: dict[str, dict[str, float]] = {}
+
+    for path, label in csv_paths_with_labels:
+        month_labels.append(label)
+        billing = read_billing_csv(path)
+        entries = billing.get(sid, [])
+        if school_brands is not None:
+            student_brands = school_brands.get(sid)
+            entries = filter_billing_by_school(entries, student_brands)
+        agg = aggregate_csv_for_student(entries)
+        monthly[label] = agg
+
+    return month_labels, monthly
+
+
 def run_check(
     school_name: str,
     month_label: str,
     csv_paths: list[str],
+    csv_paths_with_labels: list[tuple[str, str]],
     excel_path: str,
     sheet_index: int = 2,
     school_brands: dict[str, set[str]] | None = None,
 ) -> list[CheckResult]:
     """
     1校舎・1ヶ月分のチェックを実行。
-    csv_paths: 対象月±2ヶ月分のCSVパスリスト（存在するもののみ）
+    csv_paths: 対象月±2ヶ月分のCSVパスリスト（優先度順）
+    csv_paths_with_labels: [(path, "11月"), (path, "12月"), ...] 表示順
     school_brands: {生徒ID: {この校舎で受講しているブランド}} or None
     """
     csv_names = [os.path.basename(p) for p in csv_paths]
@@ -601,6 +632,8 @@ def run_check(
 
     billing = _load_billing_by_priority(csv_paths)
     sales = read_excel_sales(excel_path, sheet_index)
+
+    month_col_labels = [label for _, label in csv_paths_with_labels]
 
     ok_count = 0
     col_only_count = 0
@@ -625,11 +658,11 @@ def run_check(
                     name=name,
                     row=row_num,
                     excel_total=total,
+                    month_columns=month_col_labels,
                 ))
             continue
 
         entries = billing[sid]
-        # 校舎フィルタ: この校舎で受講していないブランドの請求を除外
         if school_brands is not None:
             student_brands = school_brands.get(sid)
             entries = filter_billing_by_school(entries, student_brands)
@@ -648,6 +681,11 @@ def run_check(
             else:
                 total_diff_count += 1
 
+            # 各月別の引落額を計算
+            _, monthly = _compute_monthly_billing(
+                sid, csv_paths_with_labels, school_brands,
+            )
+
             results.append(CheckResult(
                 school=school_name,
                 month_label=month_label,
@@ -658,6 +696,8 @@ def run_check(
                 diffs=diffs,
                 excel_total=excel_total,
                 csv_total=csv_total,
+                monthly_billing=monthly,
+                month_columns=month_col_labels,
             ))
         else:
             ok_count += 1
@@ -728,36 +768,64 @@ def write_results_csv(
     output_path: str,
     all_results: list[CheckResult],
 ) -> None:
-    """照合結果をCSVに出力"""
+    """照合結果をCSVに出力（月別引落額付き）"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # 全結果から月カラムのユニオンを取得
+    all_month_cols: list[str] = []
+    for r in all_results:
+        for mc in r.month_columns:
+            if mc not in all_month_cols:
+                all_month_cols.append(mc)
+    all_month_cols.sort()
 
     with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        header = [
             "校舎", "月", "重要度", "種別", "生徒ID", "生徒名",
-            "行番号", "項目", "Excel金額", "CSV金額", "差額", "合計差額",
-        ])
+            "行番号", "項目", "売上",
+        ]
+        for mc in all_month_cols:
+            header.append(f"{mc}引落")
+        header.extend(["差額", "合計差額"])
+        writer.writerow(header)
 
         for r in all_results:
             if r.result_type == "NOT_IN_CSV":
-                writer.writerow([
+                row_data = [
                     r.school, r.month_label, "★要確認", "CSV未登録",
                     r.sid, r.name, r.row, "売上合計",
-                    r.excel_total, 0, r.excel_total, r.excel_total,
-                ])
+                    r.excel_total,
+                ]
+                row_data.extend([0] * len(all_month_cols))
+                row_data.extend([r.excel_total, r.excel_total])
+                writer.writerow(row_data)
             elif r.diffs:
                 total_diff = r.excel_total - r.csv_total
                 total_match = abs(total_diff) < 1
-                severity = "列配分違い" if total_match else "★要確認"
-                kind = "合計一致" if total_match else "合計不一致"
+
+                # 売上あり・請求なし判定
+                if r.csv_total == 0 and r.excel_total > 0:
+                    severity = "★売上あり請求なし"
+                    kind = "請求漏れ"
+                elif total_match:
+                    severity = "列配分違い"
+                    kind = "合計一致"
+                else:
+                    severity = "★要確認"
+                    kind = "合計不一致"
 
                 for col, ev, cv, diff in r.diffs:
                     disp = COL_DISPLAY.get(col, col)
-                    writer.writerow([
+                    row_data = [
                         r.school, r.month_label, severity, kind,
-                        r.sid, r.name, r.row, disp,
-                        ev, cv, diff, total_diff,
-                    ])
+                        r.sid, r.name, r.row, disp, ev,
+                    ]
+                    for mc in all_month_cols:
+                        monthly_agg = r.monthly_billing.get(mc, {})
+                        row_data.append(monthly_agg.get(col, 0))
+                    row_data.extend([diff, total_diff])
+                    writer.writerow(row_data)
 
 
 # ====================================================================
@@ -832,10 +900,17 @@ def main():
                 if ym in csv_files and csv_files[ym] != pair.csv_path:
                     csv_paths.append(csv_files[ym])
 
+            # 表示用: 月ラベル付きCSVリスト（時系列順）
+            csv_paths_with_labels = []
+            for ym in adjacent:
+                if ym in csv_files:
+                    csv_paths_with_labels.append(
+                        (csv_files[ym], f"{ym[0]}年{ym[1]}月")
+                    )
+
             # クラス情報から校舎別ブランドフィルタを構築
             school_brands = None
             if school.school_keywords and class_info_files:
-                # 対象月に最も近いクラス情報を使用
                 best_ci = _find_nearest_class_info(
                     pair.year, pair.month, class_info_files,
                 )
@@ -848,6 +923,7 @@ def main():
                 school_name=school.name,
                 month_label=pair.label,
                 csv_paths=csv_paths,
+                csv_paths_with_labels=csv_paths_with_labels,
                 excel_path=pair.excel_path,
                 sheet_index=school.sheet_index,
                 school_brands=school_brands,

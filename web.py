@@ -1,17 +1,22 @@
+# -*- coding: utf-8 -*-
 """
 売上照合チェック Webアプリ
 
 事務員がブラウザからアクセスし、照合結果を確認・CSVダウンロードできる。
-社内ネットワークで http://<サーバーIP>:5050 でアクセス。
+社内ネットワークで http://<サーバーIP>:3006 でアクセス。
 """
 
 import io
 import csv
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, render_template_string, send_file, redirect, url_for
+from flask import (
+    Flask, render_template_string, send_file, redirect,
+    url_for, request, flash,
+)
 
 from owner_check import (
     load_config,
@@ -26,6 +31,7 @@ from owner_check import (
     _load_billing_by_priority,
     _get_adjacent_months,
     _find_nearest_class_info,
+    _compute_monthly_billing,
     read_excel_sales,
     aggregate_csv_for_student,
     compare_student,
@@ -33,27 +39,36 @@ from owner_check import (
 )
 
 app = Flask(__name__)
+app.secret_key = "owner_check_secret_key"
+
+UPLOAD_SALES_DIR = Path("C:/Users/USER/Documents")
+UPLOAD_CSV_DIR = Path("Y:/_★20170701作業用/100 真由美/野田より/◆日にち別お仕事◆")
+
 
 # ====================================================================
-# 照合ロジック（Web用にコンソール出力なし）
+# 照合ロジック（Web用）
 # ====================================================================
 
 def run_check_silent(
     school_name: str,
     month_label: str,
     csv_paths: list[str],
+    csv_paths_with_labels: list[tuple[str, str]],
     excel_path: str,
     sheet_index: int = 2,
     school_brands: dict[str, set[str]] | None = None,
 ) -> tuple[list[CheckResult], dict]:
-    """コンソール出力なしで照合チェックを実行"""
+    """コンソール出力なしで照合チェック"""
     billing = _load_billing_by_priority(csv_paths)
     sales = read_excel_sales(excel_path, sheet_index)
+
+    month_col_labels = [label for _, label in csv_paths_with_labels]
 
     ok_count = 0
     col_only_count = 0
     total_diff_count = 0
     not_in_csv_count = 0
+    no_billing_count = 0
     results: list[CheckResult] = []
 
     for sid, sdata in sorted(sales.items(), key=lambda x: x[1]["row"]):
@@ -71,6 +86,7 @@ def run_check_silent(
                     result_type="NOT_IN_CSV",
                     sid=sid, name=name, row=row_num,
                     excel_total=total,
+                    month_columns=month_col_labels,
                 ))
             continue
 
@@ -88,19 +104,34 @@ def run_check_silent(
             csv_total = sum(csv_agg.values())
             total_match = abs(excel_total - csv_total) < 1
 
-            if total_match:
+            # 売上あり・請求なし判定
+            is_no_billing = csv_total == 0 and excel_total > 0
+
+            if is_no_billing:
+                no_billing_count += 1
+            elif total_match:
                 col_only_count += 1
             else:
                 total_diff_count += 1
 
+            rtype = "NO_BILLING" if is_no_billing else (
+                "TOTAL_MATCH" if total_match else "TOTAL_DIFF"
+            )
+
+            _, monthly = _compute_monthly_billing(
+                sid, csv_paths_with_labels, school_brands,
+            )
+
             results.append(CheckResult(
                 school=school_name,
                 month_label=month_label,
-                result_type="TOTAL_MATCH" if total_match else "TOTAL_DIFF",
+                result_type=rtype,
                 sid=sid, name=name, row=row_num,
                 diffs=diffs,
                 excel_total=excel_total,
                 csv_total=csv_total,
+                monthly_billing=monthly,
+                month_columns=month_col_labels,
             ))
         else:
             ok_count += 1
@@ -111,6 +142,7 @@ def run_check_silent(
         "col_only": col_only_count,
         "total_diff": total_diff_count,
         "not_in_csv": not_in_csv_count,
+        "no_billing": no_billing_count,
     }
 
     return results, summary
@@ -142,14 +174,19 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
 
         pairs = match_months(csv_files, excel_files)
         for pair in pairs:
-            # ±2ヶ月分のCSV（対象月を先頭に）
             csv_paths = [pair.csv_path]
             adjacent = _get_adjacent_months(pair.year, pair.month, 2)
             for ym in adjacent:
                 if ym in csv_files and csv_files[ym] != pair.csv_path:
                     csv_paths.append(csv_files[ym])
 
-            # 校舎フィルタ
+            csv_paths_with_labels = []
+            for ym in adjacent:
+                if ym in csv_files:
+                    csv_paths_with_labels.append(
+                        (csv_files[ym], f"{ym[1]}月")
+                    )
+
             school_brands = None
             if school.school_keywords and class_info_files:
                 best_ci = _find_nearest_class_info(
@@ -164,6 +201,7 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                 school_name=school.name,
                 month_label=pair.label,
                 csv_paths=csv_paths,
+                csv_paths_with_labels=csv_paths_with_labels,
                 excel_path=pair.excel_path,
                 sheet_index=school.sheet_index,
                 school_brands=school_brands,
@@ -179,33 +217,48 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
 
 
 def results_to_csv_bytes(results: list[CheckResult]) -> bytes:
-    """結果をCSVバイト列に変換"""
+    """結果をCSVバイト列に変換（月別引落額付き）"""
+    all_month_cols = []
+    for r in results:
+        for mc in r.month_columns:
+            if mc not in all_month_cols:
+                all_month_cols.append(mc)
+
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow([
-        "校舎", "月", "重要度", "種別", "生徒ID", "生徒名",
-        "行番号", "項目", "Excel金額", "CSV金額", "差額", "合計差額",
-    ])
+    header = ["校舎", "月", "重要度", "種別", "生徒ID", "生徒名",
+              "行番号", "項目", "売上"]
+    for mc in all_month_cols:
+        header.append(f"{mc}引落")
+    header.extend(["差額", "合計差額"])
+    writer.writerow(header)
 
     for r in results:
         if r.result_type == "NOT_IN_CSV":
-            writer.writerow([
-                r.school, r.month_label, "★要確認", "CSV未登録",
-                r.sid, r.name, r.row, "売上合計",
-                r.excel_total, 0, r.excel_total, r.excel_total,
-            ])
+            row_data = [r.school, r.month_label, "★要確認", "CSV未登録",
+                        r.sid, r.name, r.row, "売上合計", r.excel_total]
+            row_data.extend([0] * len(all_month_cols))
+            row_data.extend([r.excel_total, r.excel_total])
+            writer.writerow(row_data)
         elif r.diffs:
             total_diff = r.excel_total - r.csv_total
             total_match = abs(total_diff) < 1
-            severity = "列配分違い" if total_match else "★要確認"
-            kind = "合計一致" if total_match else "合計不一致"
+            if r.result_type == "NO_BILLING":
+                severity, kind = "★売上あり請求なし", "請求漏れ"
+            elif total_match:
+                severity, kind = "列配分違い", "合計一致"
+            else:
+                severity, kind = "★要確認", "合計不一致"
+
             for col, ev, cv, diff in r.diffs:
                 disp = COL_DISPLAY.get(col, col)
-                writer.writerow([
-                    r.school, r.month_label, severity, kind,
-                    r.sid, r.name, r.row, disp,
-                    ev, cv, diff, total_diff,
-                ])
+                row_data = [r.school, r.month_label, severity, kind,
+                            r.sid, r.name, r.row, disp, ev]
+                for mc in all_month_cols:
+                    monthly_agg = r.monthly_billing.get(mc, {})
+                    row_data.append(monthly_agg.get(col, 0))
+                row_data.extend([diff, total_diff])
+                writer.writerow(row_data)
 
     return output.getvalue().encode("utf-8-sig")
 
@@ -224,12 +277,15 @@ HTML_TEMPLATE = """
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Yu Gothic', 'Meiryo', sans-serif; background: #f5f5f5; color: #333; }
-        .header { background: #1a5276; color: white; padding: 16px 24px; }
+        .header { background: #1a5276; color: white; padding: 16px 24px; display: flex;
+                  justify-content: space-between; align-items: center; }
         .header h1 { font-size: 20px; font-weight: 500; }
         .header .sub { font-size: 12px; color: #aed6f1; margin-top: 4px; }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .header-right a { color: #aed6f1; font-size: 13px; text-decoration: none; margin-left: 16px; }
+        .header-right a:hover { color: white; }
+        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
 
-        .actions { display: flex; gap: 12px; margin-bottom: 20px; align-items: center; }
+        .actions { display: flex; gap: 12px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; }
         .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 6px;
                font-size: 14px; cursor: pointer; text-decoration: none; font-weight: 500; }
         .btn-primary { background: #2980b9; color: white; }
@@ -238,7 +294,7 @@ HTML_TEMPLATE = """
         .btn-success:hover { background: #229954; }
         .btn-loading { background: #95a5a6; color: white; pointer-events: none; }
 
-        .summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+        .summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
                         gap: 16px; margin-bottom: 24px; }
         .summary-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         .summary-card h3 { font-size: 15px; color: #1a5276; margin-bottom: 12px;
@@ -249,50 +305,63 @@ HTML_TEMPLATE = """
         .value.ok { color: #27ae60; }
         .value.warn { color: #e67e22; }
         .value.critical { color: #e74c3c; }
+        .value.nobill { color: #8e44ad; }
 
-        .tabs { display: flex; gap: 4px; margin-bottom: 0; }
-        .tab { padding: 10px 20px; background: #ddd; border: none; border-radius: 8px 8px 0 0;
+        .tabs { display: flex; gap: 4px; margin-bottom: 0; flex-wrap: wrap; }
+        .tab { padding: 10px 16px; background: #ddd; border: none; border-radius: 8px 8px 0 0;
                cursor: pointer; font-size: 13px; font-weight: 500; }
-        .tab.active { background: white; color: #e74c3c; font-weight: 700; }
-        .tab.tab-col { }
-        .tab.tab-col.active { color: #e67e22; }
-        .tab.tab-csv { }
-        .tab.tab-csv.active { color: #7f8c8d; }
+        .tab.active { background: white; font-weight: 700; }
 
         .table-wrap { background: white; border-radius: 0 8px 8px 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-                      overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { background: #f8f9fa; padding: 10px 12px; text-align: left; font-weight: 600;
-             border-bottom: 2px solid #dee2e6; white-space: nowrap; position: sticky; top: 0; }
-        td { padding: 8px 12px; border-bottom: 1px solid #eee; }
-        tr:hover { background: #f8f9fa; }
+                      overflow-x: auto; max-height: 70vh; overflow-y: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th { background: #f8f9fa; padding: 8px 10px; text-align: left; font-weight: 600;
+             border-bottom: 2px solid #dee2e6; white-space: nowrap; position: sticky; top: 0; z-index: 1; }
+        td { padding: 6px 10px; border-bottom: 1px solid #eee; white-space: nowrap; }
+        tr:hover { background: #f0f7fc; }
         .num { text-align: right; font-family: 'Consolas', monospace; }
         .positive { color: #e74c3c; }
         .negative { color: #2980b9; }
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-        .badge-critical { background: #fde8e8; color: #e74c3c; }
-        .badge-warn { background: #fef3e2; color: #e67e22; }
-        .badge-info { background: #eaf2f8; color: #2980b9; }
+        .month-col { background: #fafafa; }
+        .month-col.has-value { background: #e8f8f5; font-weight: 600; }
 
         .filter-bar { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
         .filter-bar label { font-size: 13px; font-weight: 500; }
         .filter-bar select { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
 
         .empty { text-align: center; padding: 40px; color: #999; }
-        .loading { text-align: center; padding: 60px; }
-        .loading .spinner { display: inline-block; width: 40px; height: 40px; border: 4px solid #eee;
-                            border-top: 4px solid #2980b9; border-radius: 50%; animation: spin 0.8s linear infinite; }
-        @keyframes spin { to { transform: rotate(360deg); } }
         .timestamp { font-size: 12px; color: #999; }
+        .flash { background: #d4edda; color: #155724; padding: 10px 16px; border-radius: 6px;
+                 margin-bottom: 16px; font-size: 13px; }
+        .flash-error { background: #f8d7da; color: #721c24; }
+
+        .upload-section { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px;
+                          box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .upload-section h3 { font-size: 15px; color: #1a5276; margin-bottom: 12px; }
+        .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .upload-box { border: 2px dashed #ccc; border-radius: 8px; padding: 16px; text-align: center; }
+        .upload-box h4 { font-size: 14px; margin-bottom: 8px; }
+        .upload-box p { font-size: 12px; color: #888; margin-bottom: 8px; }
+        .upload-box input[type=file] { font-size: 12px; }
+        .upload-box .btn { margin-top: 8px; font-size: 12px; padding: 6px 16px; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>���上明細 照合チェック</h1>
-        <div class="sub">売上申請（Excel）と請求データ（CSV）の自動照合システム</div>
+        <div>
+            <h1>売上照合チェック</h1>
+            <div class="sub">売上申請と請求データの自動照合 / 前後2ヶ月引落参照 / 校舎フィルタ適用</div>
+        </div>
+        <div class="header-right">
+            <a href="/upload">データ登録</a>
+        </div>
     </div>
 
     <div class="container">
+        {% for msg in get_flashed_messages() %}
+        <div class="flash">{{ msg }}</div>
+        {% endfor %}
+
         <div class="actions">
             <a href="/run" class="btn btn-primary" id="runBtn"
                onclick="this.textContent='チェック実行中...'; this.classList.add('btn-loading');">
@@ -310,9 +379,9 @@ HTML_TEMPLATE = """
         <div class="summary-grid">
             {% for s in summaries %}
             <div class="summary-card">
-                <h3>{{ s.school }} — {{ s.month }}</h3>
+                <h3>{{ s.school }} ― {{ s.month }}</h3>
                 <div class="summary-row">
-                    <span class="label">Excel生徒数</span>
+                    <span class="label">生徒数</span>
                     <span class="value">{{ s.total }}人</span>
                 </div>
                 <div class="summary-row">
@@ -326,6 +395,10 @@ HTML_TEMPLATE = """
                 <div class="summary-row">
                     <span class="label">合計不一致（要確認）</span>
                     <span class="value critical">{{ s.total_diff }}人</span>
+                </div>
+                <div class="summary-row">
+                    <span class="label">売上あり請求なし</span>
+                    <span class="value nobill">{{ s.no_billing }}人</span>
                 </div>
                 <div class="summary-row">
                     <span class="label">CSV未登録</span>
@@ -351,29 +424,37 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="tabs">
-            <button class="tab active" onclick="showTab('critical', this)">
+            <button class="tab active" onclick="showTab('critical', this)" style="color:#e74c3c">
                 合計不一致（{{ count_critical }}件）
             </button>
-            <button class="tab tab-csv" onclick="showTab('not_csv', this)">
+            <button class="tab" onclick="showTab('no_billing', this)" style="color:#8e44ad">
+                売上あり請求なし（{{ count_no_billing }}件）
+            </button>
+            <button class="tab" onclick="showTab('not_csv', this)" style="color:#7f8c8d">
                 CSV未登録（{{ count_not_csv }}件）
             </button>
-            <button class="tab tab-col" onclick="showTab('col_only', this)">
+            <button class="tab" onclick="showTab('col_only', this)" style="color:#e67e22">
                 列配分違い（{{ count_col_only }}件）
             </button>
         </div>
 
         <div class="table-wrap">
-            <!-- 合計不一致 -->
-            <table id="table-critical">
+            {% for tab_name, tab_rows, tab_type in [
+                ('critical', critical_rows, 'full'),
+                ('no_billing', no_billing_rows, 'full'),
+                ('col_only', col_only_rows, 'full'),
+            ] %}
+            <table id="table-{{ tab_name }}" {% if not loop.first %}style="display:none;"{% endif %}>
                 <thead>
                     <tr>
                         <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
-                        <th>行</th><th>項目</th>
-                        <th>Excel金額</th><th>CSV金額</th><th>差額</th><th>合計差額</th>
+                        <th>行</th><th>項目</th><th>売上</th>
+                        {% for mc in all_month_cols %}<th>{{ mc }}引落</th>{% endfor %}
+                        <th>差額</th><th>合計差額</th>
                     </tr>
                 </thead>
                 <tbody>
-                {% for r in critical_rows %}
+                {% for r in tab_rows %}
                     <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
                         <td>{{ r.school }}</td>
                         <td>{{ r.month }}</td>
@@ -382,67 +463,38 @@ HTML_TEMPLATE = """
                         <td class="num">{{ r.row }}</td>
                         <td>{{ r.item }}</td>
                         <td class="num">{{ r.excel }}</td>
-                        <td class="num">{{ r.csv }}</td>
+                        {% for mv in r.month_vals %}
+                        <td class="num month-col {{ 'has-value' if mv != '0' else '' }}">{{ mv }}</td>
+                        {% endfor %}
                         <td class="num {{ 'positive' if r.diff_val > 0 else 'negative' if r.diff_val < 0 else '' }}">{{ r.diff }}</td>
                         <td class="num {{ 'positive' if r.total_diff_val > 0 else 'negative' if r.total_diff_val < 0 else '' }}">{{ r.total_diff }}</td>
                     </tr>
                 {% endfor %}
-                {% if not critical_rows %}
-                    <tr><td colspan="10" class="empty">合計不一致はありません</td></tr>
+                {% if not tab_rows %}
+                    <tr><td colspan="{{ 9 + all_month_cols|length }}" class="empty">該当なし</td></tr>
                 {% endif %}
                 </tbody>
             </table>
+            {% endfor %}
 
-            <!-- CSV未登録 -->
             <table id="table-not_csv" style="display:none;">
                 <thead>
                     <tr>
                         <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
-                        <th>行</th><th>Excel売��</th>
+                        <th>行</th><th>売上</th>
                     </tr>
                 </thead>
                 <tbody>
                 {% for r in not_csv_rows %}
                     <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
-                        <td>{{ r.school }}</td>
-                        <td>{{ r.month }}</td>
-                        <td>{{ r.sid }}</td>
-                        <td>{{ r.name }}</td>
+                        <td>{{ r.school }}</td><td>{{ r.month }}</td>
+                        <td>{{ r.sid }}</td><td>{{ r.name }}</td>
                         <td class="num">{{ r.row }}</td>
                         <td class="num">{{ r.excel }}</td>
                     </tr>
                 {% endfor %}
                 {% if not not_csv_rows %}
-                    <tr><td colspan="6" class="empty">CSV未登録はありません</td></tr>
-                {% endif %}
-                </tbody>
-            </table>
-
-            <!-- 列配分違い -->
-            <table id="table-col_only" style="display:none;">
-                <thead>
-                    <tr>
-                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
-                        <th>行</th><th>項目</th>
-                        <th>Excel金額</th><th>CSV金額</th><th>差額</th>
-                    </tr>
-                </thead>
-                <tbody>
-                {% for r in col_only_rows %}
-                    <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
-                        <td>{{ r.school }}</td>
-                        <td>{{ r.month }}</td>
-                        <td>{{ r.sid }}</td>
-                        <td>{{ r.name }}</td>
-                        <td class="num">{{ r.row }}</td>
-                        <td>{{ r.item }}</td>
-                        <td class="num">{{ r.excel }}</td>
-                        <td class="num">{{ r.csv }}</td>
-                        <td class="num {{ 'positive' if r.diff_val > 0 else 'negative' if r.diff_val < 0 else '' }}">{{ r.diff }}</td>
-                    </tr>
-                {% endfor %}
-                {% if not col_only_rows %}
-                    <tr><td colspan="9" class="empty">列配分違いはありません</td></tr>
+                    <tr><td colspan="6" class="empty">該当なし</td></tr>
                 {% endif %}
                 </tbody>
             </table>
@@ -463,7 +515,6 @@ HTML_TEMPLATE = """
         btn.classList.add('active');
         filterTable();
     }
-
     function filterTable() {
         const school = document.getElementById('filterSchool').value;
         const month = document.getElementById('filterMonth').value;
@@ -471,11 +522,99 @@ HTML_TEMPLATE = """
             if (tr.querySelector('.empty')) return;
             const s = tr.getAttribute('data-school') || '';
             const m = tr.getAttribute('data-month') || '';
-            const show = (!school || s === school) && (!month || m === month);
-            tr.style.display = show ? '' : 'none';
+            tr.style.display = (!school || s === school) && (!month || m === month) ? '' : 'none';
         });
     }
     </script>
+</body>
+</html>
+"""
+
+UPLOAD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>データ登録 - 売上照合チェック</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Yu Gothic', 'Meiryo', sans-serif; background: #f5f5f5; color: #333; }
+        .header { background: #1a5276; color: white; padding: 16px 24px; display: flex;
+                  justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 20px; font-weight: 500; }
+        .header-right a { color: #aed6f1; font-size: 13px; text-decoration: none; }
+        .header-right a:hover { color: white; }
+        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+        .upload-section { background: white; border-radius: 8px; padding: 24px; margin-bottom: 20px;
+                          box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .upload-section h3 { font-size: 16px; color: #1a5276; margin-bottom: 4px; }
+        .upload-section .desc { font-size: 12px; color: #888; margin-bottom: 16px; }
+        .form-row { margin-bottom: 12px; }
+        .form-row label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; }
+        .form-row select, .form-row input[type=file] { font-size: 13px; padding: 6px 10px; }
+        .form-row select { border: 1px solid #ccc; border-radius: 4px; }
+        .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 6px;
+               font-size: 14px; cursor: pointer; font-weight: 500; }
+        .btn-primary { background: #2980b9; color: white; }
+        .btn-primary:hover { background: #2471a3; }
+        .flash { background: #d4edda; color: #155724; padding: 10px 16px; border-radius: 6px;
+                 margin-bottom: 16px; font-size: 13px; }
+        .flash-error { background: #f8d7da; color: #721c24; }
+        .schools-list { font-size: 12px; color: #666; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>データ登録</h1>
+        <div class="header-right">
+            <a href="/">← 照合チェックに戻る</a>
+        </div>
+    </div>
+    <div class="container">
+        {% for msg in get_flashed_messages() %}
+        <div class="flash">{{ msg }}</div>
+        {% endfor %}
+
+        <div class="upload-section">
+            <h3>売上明細の登録</h3>
+            <p class="desc">校舎の売上明細書（Excel）を登録します。ファイルは校舎フォルダに自動配置されます。</p>
+            <form action="/upload/sales" method="post" enctype="multipart/form-data">
+                <div class="form-row">
+                    <label>校舎を選択:</label>
+                    <select name="school">
+                        {% for s in schools %}<option value="{{ s.name }}">{{ s.name }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label>売上明細Excel (.xlsm / .xlsx):</label>
+                    <input type="file" name="file" accept=".xlsm,.xlsx" required>
+                </div>
+                <button type="submit" class="btn btn-primary">登録</button>
+            </form>
+            <div class="schools-list">
+                登録済み校舎フォルダ:
+                {% for s in schools %}{{ s.name }}({{ s.excel_dir }}) {% endfor %}
+            </div>
+        </div>
+
+        <div class="upload-section">
+            <h3>引落結果（請求CSV）の登録</h3>
+            <p class="desc">請求CSVファイルを登録します。送信日フォルダに自動配置されます。</p>
+            <form action="/upload/csv" method="post" enctype="multipart/form-data">
+                <div class="form-row">
+                    <label>請求CSV (.csv):</label>
+                    <input type="file" name="file" accept=".csv" required>
+                </div>
+                <div class="form-row">
+                    <label>送信日フォルダ名 (例: 20260313_送信日):</label>
+                    <input type="text" name="folder_name" placeholder="20260313_送信日"
+                           style="font-size:13px; padding:6px 10px; border:1px solid #ccc; border-radius:4px; width:300px;" required>
+                </div>
+                <button type="submit" class="btn btn-primary">登録</button>
+            </form>
+        </div>
+    </div>
 </body>
 </html>
 """
@@ -485,7 +624,6 @@ HTML_TEMPLATE = """
 # ルーティング
 # ====================================================================
 
-# グローバルに結果を保持（シンプルなインメモリキャッシュ）
 _cache: dict = {"results": None, "summaries": None, "timestamp": None}
 
 
@@ -495,15 +633,49 @@ def _format_number(val: float) -> str:
     return f"{val:,.0f}"
 
 
+def _build_row(r, col, ev, cv, diff, total_diff, all_month_cols):
+    """1行分のテンプレートデータを構築"""
+    disp = COL_DISPLAY.get(col, col)
+    month_vals = []
+    for mc in all_month_cols:
+        monthly_agg = r.monthly_billing.get(mc, {})
+        v = monthly_agg.get(col, 0)
+        month_vals.append(_format_number(v))
+
+    return {
+        "school": r.school,
+        "month": r.month_label,
+        "sid": r.sid,
+        "name": r.name,
+        "row": r.row,
+        "item": disp,
+        "excel": _format_number(ev),
+        "month_vals": month_vals,
+        "diff": _format_number(diff),
+        "diff_val": diff,
+        "total_diff": _format_number(total_diff),
+        "total_diff_val": total_diff,
+    }
+
+
 def _build_template_data() -> dict:
     results = _cache["results"]
     summaries = _cache["summaries"]
     timestamp = _cache["timestamp"]
 
     if results is None:
-        return {"results": None, "summaries": None, "timestamp": None}
+        return {"results": None, "summaries": None, "timestamp": None,
+                "all_month_cols": []}
+
+    # 全結果から月カラム収集
+    all_month_cols = []
+    for r in results:
+        for mc in r.month_columns:
+            if mc not in all_month_cols:
+                all_month_cols.append(mc)
 
     critical_rows = []
+    no_billing_rows = []
     not_csv_rows = []
     col_only_rows = []
 
@@ -519,25 +691,18 @@ def _build_template_data() -> dict:
             })
         elif r.diffs:
             total_diff = r.excel_total - r.csv_total
-            total_match = abs(total_diff) < 1
-            target = col_only_rows if total_match else critical_rows
+
+            if r.result_type == "NO_BILLING":
+                target = no_billing_rows
+            elif r.result_type == "TOTAL_MATCH":
+                target = col_only_rows
+            else:
+                target = critical_rows
 
             for col, ev, cv, diff in r.diffs:
-                disp = COL_DISPLAY.get(col, col)
-                target.append({
-                    "school": r.school,
-                    "month": r.month_label,
-                    "sid": r.sid,
-                    "name": r.name,
-                    "row": r.row,
-                    "item": disp,
-                    "excel": _format_number(ev),
-                    "csv": _format_number(cv),
-                    "diff": _format_number(diff),
-                    "diff_val": diff,
-                    "total_diff": _format_number(total_diff),
-                    "total_diff_val": total_diff,
-                })
+                target.append(
+                    _build_row(r, col, ev, cv, diff, total_diff, all_month_cols)
+                )
 
     school_names = sorted(set(r.school for r in results))
     month_names = sorted(set(r.month_label for r in results))
@@ -546,10 +711,13 @@ def _build_template_data() -> dict:
         "results": results,
         "summaries": summaries,
         "timestamp": timestamp,
+        "all_month_cols": all_month_cols,
         "critical_rows": critical_rows,
+        "no_billing_rows": no_billing_rows,
         "not_csv_rows": not_csv_rows,
         "col_only_rows": col_only_rows,
         "count_critical": len(critical_rows),
+        "count_no_billing": len(no_billing_rows),
         "count_not_csv": len(not_csv_rows),
         "count_col_only": len(col_only_rows),
         "school_names": school_names,
@@ -576,17 +744,65 @@ def run():
 def download():
     if _cache["results"] is None:
         return redirect(url_for("index"))
-
     csv_bytes = results_to_csv_bytes(_cache["results"])
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"照合結果_{timestamp}.csv"
-
     return send_file(
         io.BytesIO(csv_bytes),
         mimetype="text/csv",
         as_attachment=True,
-        download_name=filename,
+        download_name=f"照合結果_{timestamp}.csv",
     )
+
+
+@app.route("/upload")
+def upload_page():
+    config = load_config()
+    schools = []
+    for s in config["schools"]:
+        schools.append({"name": s["name"], "excel_dir": s["excel_dir"]})
+    return render_template_string(UPLOAD_TEMPLATE, schools=schools)
+
+
+@app.route("/upload/sales", methods=["POST"])
+def upload_sales():
+    config = load_config()
+    school_name = request.form.get("school")
+    file = request.files.get("file")
+    if not file or not school_name:
+        flash("ファイルまたは校舎が選択されていません")
+        return redirect(url_for("upload_page"))
+
+    school_cfg = None
+    for s in config["schools"]:
+        if s["name"] == school_name:
+            school_cfg = s
+            break
+    if not school_cfg:
+        flash(f"校舎 '{school_name}' が見つかりません")
+        return redirect(url_for("upload_page"))
+
+    dest_dir = Path(school_cfg["excel_dir"])
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / file.filename
+    file.save(str(dest))
+    flash(f"売上明細を登録しました: {dest}")
+    return redirect(url_for("upload_page"))
+
+
+@app.route("/upload/csv", methods=["POST"])
+def upload_csv():
+    file = request.files.get("file")
+    folder_name = request.form.get("folder_name", "").strip()
+    if not file or not folder_name:
+        flash("ファイルまたはフォルダ名が入力されていません")
+        return redirect(url_for("upload_page"))
+
+    dest_dir = UPLOAD_CSV_DIR / folder_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / file.filename
+    file.save(str(dest))
+    flash(f"請求CSVを登録しました: {dest}")
+    return redirect(url_for("upload_page"))
 
 
 if __name__ == "__main__":
