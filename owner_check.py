@@ -67,6 +67,7 @@ class CheckResult:
     monthly_billing: dict = field(default_factory=dict)
     # 備考: {列レター: コメント文字列}
     remarks: dict = field(default_factory=dict)
+    grade: str = ""
     # 対象月の前後月ラベルリスト（表示順）
     month_columns: list = field(default_factory=list)
 
@@ -421,7 +422,7 @@ def parse_number(val) -> float:
 
 
 def read_billing_csv(csv_path: str) -> dict[str, list[tuple[str, str, float]]]:
-    """請求CSVを読み込み → {生徒ID: [(ブランド名, カテ��リ名, 月額料金), ...]}"""
+    """請求CSVを読み込み → {生徒ID: [(ブランド名, カテゴリ名, 月額料金), ...]}"""
     result = {}
     with open(csv_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -434,6 +435,26 @@ def read_billing_csv(csv_path: str) -> dict[str, list[tuple[str, str, float]]]:
                 result[sid] = []
             result[sid].append((brand, category, amount))
     return result
+
+
+# 学年情報キャッシュ
+_grade_cache: dict[str, dict[str, str]] = {}
+
+
+def read_grades_from_csv(csv_path: str) -> dict[str, str]:
+    """請求CSVから生徒IDと学年の対応を取得 → {生徒ID: 学年}"""
+    if csv_path in _grade_cache:
+        return _grade_cache[csv_path]
+    grades = {}
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sid = row["生徒ID"].strip()
+            grade = row.get("学年", "").strip()
+            if sid and grade and sid not in grades:
+                grades[sid] = grade
+    _grade_cache[csv_path] = grades
+    return grades
 
 
 def aggregate_csv_for_student(
@@ -720,6 +741,7 @@ def run_check(
 
     billing = _load_billing_by_priority(csv_paths)
     sales = read_excel_sales(excel_path, sheet_index)
+    grades = read_grades_from_csv(csv_paths[0])  # 対象月CSVから学年取得
 
     month_col_labels = [label for _, label in csv_paths_with_labels]
 
@@ -756,6 +778,7 @@ def run_check(
                 row=row_num,
                 excel_total=excel_total_raw,
                 month_columns=month_col_labels,
+                grade=grades.get(sid, ""),
             ))
             continue
 
@@ -826,6 +849,7 @@ def run_check(
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
                     remarks=remarks,
+                    grade=grades.get(sid, ""),
                 ))
 
             if other_diffs:
@@ -845,6 +869,7 @@ def run_check(
                     csv_total=csv_total,
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
+                    grade=grades.get(sid, ""),
                 ))
             elif not unbilled_diffs:
                 # unbilledもotherもない（ありえないが安全策）

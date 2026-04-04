@@ -36,6 +36,7 @@ from owner_check import (
     _compute_monthly_billing,
     _find_similar_billing,
     read_excel_sales,
+    read_grades_from_csv,
     aggregate_csv_for_student,
     compare_student,
     COL_DISPLAY,
@@ -65,6 +66,7 @@ def run_check_silent(
     """コンソール出力なしで照合チェック"""
     billing = _load_billing_by_priority(csv_paths)
     sales = read_excel_sales(excel_path, sheet_index)
+    grades = read_grades_from_csv(csv_paths[0])
 
     month_col_labels = [label for _, label in csv_paths_with_labels]
     all_billings = _preload_all_billings(csv_paths_with_labels)
@@ -97,6 +99,7 @@ def run_check_silent(
                 sid=sid, name=name, row=row_num,
                 excel_total=excel_total_raw,
                 month_columns=month_col_labels,
+                grade=grades.get(sid, ""),
             ))
             continue
 
@@ -163,6 +166,7 @@ def run_check_silent(
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
                     remarks=remarks,
+                    grade=grades.get(sid, ""),
                 ))
 
             if other_diffs:
@@ -182,6 +186,7 @@ def run_check_silent(
                     csv_total=csv_total,
                     monthly_billing=monthly,
                     month_columns=month_col_labels,
+                    grade=grades.get(sid, ""),
                 ))
         else:
             ok_count += 1
@@ -503,7 +508,7 @@ HTML_TEMPLATE = """
             <table id="table-{{ tab_name }}" {% if not loop.first %}style="display:none;"{% endif %}>
                 <thead>
                     <tr>
-                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
+                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th><th>学年</th>
                         <th>行</th><th>項目</th><th>売上</th>
                         {% for mc in all_month_cols %}<th>{{ mc }}引落</th>{% endfor %}
                         <th>差額</th><th>合計差額</th>
@@ -516,7 +521,7 @@ HTML_TEMPLATE = """
                         <td>{{ r.school }}</td>
                         <td>{{ r.month }}</td>
                         <td>{{ r.sid }}</td>
-                        <td>{{ r.name }}</td>
+                        <td>{{ r.name }}</td><td>{{ r.grade }}</td>
                         <td class="num">{{ r.row }}</td>
                         <td>{{ r.item }}</td>
                         <td class="num">{{ r.excel }}</td>
@@ -540,7 +545,7 @@ HTML_TEMPLATE = """
             <table id="table-withdrawn" style="display:none;">
                 <thead>
                     <tr>
-                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
+                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th><th>学年</th>
                         <th>行</th><th>売上</th>
                     </tr>
                 </thead>
@@ -548,13 +553,13 @@ HTML_TEMPLATE = """
                 {% for r in withdrawn_rows %}
                     <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
                         <td>{{ r.school }}</td><td>{{ r.month }}</td>
-                        <td>{{ r.sid }}</td><td>{{ r.name }}</td>
+                        <td>{{ r.sid }}</td><td>{{ r.name }}</td><td>{{ r.grade }}</td>
                         <td class="num">{{ r.row }}</td>
                         <td class="num">{{ r.excel }}</td>
                     </tr>
                 {% endfor %}
                 {% if not withdrawn_rows %}
-                    <tr><td colspan="6" class="empty">該当なし</td></tr>
+                    <tr><td colspan="7" class="empty">該当なし</td></tr>
                 {% endif %}
                 </tbody>
             </table>
@@ -562,7 +567,7 @@ HTML_TEMPLATE = """
             <table id="table-not_csv" style="display:none;">
                 <thead>
                     <tr>
-                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th>
+                        <th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th><th>学年</th>
                         <th>行</th><th>売上</th>
                     </tr>
                 </thead>
@@ -570,13 +575,13 @@ HTML_TEMPLATE = """
                 {% for r in not_csv_rows %}
                     <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
                         <td>{{ r.school }}</td><td>{{ r.month }}</td>
-                        <td>{{ r.sid }}</td><td>{{ r.name }}</td>
+                        <td>{{ r.sid }}</td><td>{{ r.name }}</td><td>{{ r.grade }}</td>
                         <td class="num">{{ r.row }}</td>
                         <td class="num">{{ r.excel }}</td>
                     </tr>
                 {% endfor %}
                 {% if not not_csv_rows %}
-                    <tr><td colspan="6" class="empty">該当なし</td></tr>
+                    <tr><td colspan="7" class="empty">該当なし</td></tr>
                 {% endif %}
                 </tbody>
             </table>
@@ -809,6 +814,7 @@ def _build_row(r, col, ev, cv, diff, total_diff, all_month_cols):
         "total_diff": _format_number(total_diff),
         "total_diff_val": total_diff,
         "remark": r.remarks.get(col, "") if hasattr(r, "remarks") else "",
+        "grade": r.grade if hasattr(r, "grade") else "",
     }
 
 
@@ -842,6 +848,7 @@ def _build_template_data() -> dict:
                 "name": r.name,
                 "row": r.row,
                 "excel": _format_number(r.excel_total),
+                "grade": r.grade if hasattr(r, "grade") else "",
             })
         elif r.result_type == "NOT_IN_CSV":
             not_csv_rows.append({
@@ -851,6 +858,7 @@ def _build_template_data() -> dict:
                 "name": r.name,
                 "row": r.row,
                 "excel": _format_number(r.excel_total),
+                "grade": r.grade if hasattr(r, "grade") else "",
             })
         elif r.diffs:
             total_diff = r.excel_total - r.csv_total
