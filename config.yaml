@@ -6,6 +6,9 @@
 # 請求CSV格納ディレクトリ（全校舎共通）
 csv_base_dir: "Y:/_★20170701作業用/100 真由美/野田より/◆日にち別お仕事◆"
 
+# ユーザークラス情報ディレクトリ（校舎別受講フィルタ用）
+class_info_dir: "C:/Users/USER/Desktop/ユーザークラス情報"
+
 # 照合結果の出力先ディレクトリ
 output_dir: "C:/Users/USER/Documents/照合結果"
 
@@ -13,12 +16,16 @@ output_dir: "C:/Users/USER/Documents/照合結果"
 schools:
   - name: "小幡"
     excel_dir: "C:/Users/USER/Documents/小幡売上"
-    # {name} = 校舎名, {year} = 西暦4桁, {month} = 月2桁
     excel_pattern: "{name}売上明細書({year}.{month}).xlsm"
     sheet_index: 2  # 売上明細シート（0始まり）
+    # クラス情報の校舎名に含まれる文字列（部分一致）
+    school_keywords:
+      - "小幡"
 
   # --- 新しい校舎の追加例 ---
   # - name: "千種"
   #   excel_dir: "C:/Users/USER/Documents/千種売上"
   #   excel_pattern: "{name}売上明細書({year}.{month}).xlsm"
   #   sheet_index: 2
+  #   school_keywords:
+  #     - "千種"

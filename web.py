@@ -19,8 +19,13 @@ from owner_check import (
     CheckResult,
     discover_csv_files,
     discover_excel_files,
+    discover_class_info_files,
     match_months,
-    read_billing_csv,
+    read_class_info,
+    filter_billing_by_school,
+    _load_billing_by_priority,
+    _get_adjacent_months,
+    _find_nearest_class_info,
     read_excel_sales,
     aggregate_csv_for_student,
     compare_student,
@@ -36,12 +41,13 @@ app = Flask(__name__)
 def run_check_silent(
     school_name: str,
     month_label: str,
-    csv_path: str,
+    csv_paths: list[str],
     excel_path: str,
     sheet_index: int = 2,
+    school_brands: dict[str, set[str]] | None = None,
 ) -> tuple[list[CheckResult], dict]:
     """コンソール出力なしで照合チェックを実行"""
-    billing = read_billing_csv(csv_path)
+    billing = _load_billing_by_priority(csv_paths)
     sales = read_excel_sales(excel_path, sheet_index)
 
     ok_count = 0
@@ -68,7 +74,11 @@ def run_check_silent(
                 ))
             continue
 
-        csv_agg = aggregate_csv_for_student(billing[sid])
+        entries = billing[sid]
+        if school_brands is not None:
+            student_brands = school_brands.get(sid)
+            entries = filter_billing_by_school(entries, student_brands)
+        csv_agg = aggregate_csv_for_student(entries)
         diffs = compare_student(excel_cols, csv_agg)
 
         if diffs:
@@ -110,9 +120,18 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
     """全校舎・全月の照合を実行"""
     config = load_config()
     csv_base_dir = config["csv_base_dir"]
-    schools = [SchoolConfig(**s) for s in config["schools"]]
+    class_info_dir = config.get("class_info_dir", "")
+    schools = []
+    for s in config["schools"]:
+        s = dict(s)
+        kw = s.pop("school_keywords", [])
+        schools.append(SchoolConfig(**s, school_keywords=tuple(kw)))
 
     csv_files = discover_csv_files(csv_base_dir)
+    class_info_files = {}
+    if class_info_dir:
+        class_info_files = discover_class_info_files(class_info_dir)
+
     all_results: list[CheckResult] = []
     all_summaries: list[dict] = []
 
@@ -123,12 +142,31 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
 
         pairs = match_months(csv_files, excel_files)
         for pair in pairs:
+            # ±2ヶ月分のCSV（対象月を先頭に）
+            csv_paths = [pair.csv_path]
+            adjacent = _get_adjacent_months(pair.year, pair.month, 2)
+            for ym in adjacent:
+                if ym in csv_files and csv_files[ym] != pair.csv_path:
+                    csv_paths.append(csv_files[ym])
+
+            # 校舎フィルタ
+            school_brands = None
+            if school.school_keywords and class_info_files:
+                best_ci = _find_nearest_class_info(
+                    pair.year, pair.month, class_info_files,
+                )
+                if best_ci:
+                    school_brands = read_class_info(
+                        best_ci, school.school_keywords,
+                    )
+
             results, summary = run_check_silent(
                 school_name=school.name,
                 month_label=pair.label,
-                csv_path=pair.csv_path,
+                csv_paths=csv_paths,
                 excel_path=pair.excel_path,
                 sheet_index=school.sheet_index,
+                school_brands=school_brands,
             )
             all_results.extend(results)
             all_summaries.append({

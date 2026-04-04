@@ -37,6 +37,7 @@ class SchoolConfig:
     excel_dir: str
     excel_pattern: str
     sheet_index: int = 2
+    school_keywords: tuple[str, ...] = ()  # クラス情報の校舎名マッチ用
 
 
 @dataclass(frozen=True)
@@ -233,6 +234,120 @@ def match_months(
 
 
 # ====================================================================
+# ユーザークラス情報（校舎別受講フィルタ）
+# ====================================================================
+
+def discover_class_info_files(
+    class_info_dir: str,
+) -> dict[tuple[int, int], str]:
+    """
+    クラス情報Excelを自動検出。ファイル名から月を抽出。
+    返り値: {(year, month): path}
+    """
+    result = {}
+    d = Path(class_info_dir)
+    if not d.exists():
+        return result
+
+    month_map = {
+        "1月": 1, "2月": 2, "3月": 3, "4月": 4, "5月": 5, "6月": 6,
+        "7月": 7, "8月": 8, "9月": 9, "10月": 10, "11月": 11, "12月": 12,
+    }
+
+    for f in d.iterdir():
+        if not f.is_file() or f.suffix not in (".xlsx", ".xlsm"):
+            continue
+        # "1月末.xlsx", "11月分.xlsx" etc.
+        m = re.search(r"(\d{1,2})月", f.name)
+        if not m:
+            continue
+        month = int(m.group(1))
+        # 年は修正日時から推定（ファイル名に年がないため）
+        year = datetime.fromtimestamp(f.stat().st_mtime).year
+        result[(year, month)] = str(f)
+
+    return result
+
+
+def read_class_info(
+    class_info_path: str,
+    school_keywords: tuple[str, ...],
+) -> dict[str, set[str]]:
+    """
+    クラス情報を読み込み、指定校舎に在籍する生徒のブランド一覧を返す。
+    返り値: {生徒ID: {この校舎で受講しているブランド名のset}}
+
+    校舎名にschool_keywordsのいずれかが含まれていれば、その校舎のブランドとみなす。
+    """
+    wb = openpyxl.load_workbook(class_info_path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    sid_brands: dict[str, set[str]] = {}
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=False):
+        sid_val = row[6].value   # G=生徒ID
+        brand = row[25].value    # Z=ブランド名
+        school = row[31].value   # AF=校舎名
+
+        if sid_val is None or school is None:
+            continue
+
+        sid = str(int(sid_val)) if isinstance(sid_val, (int, float)) else str(sid_val)
+        school_str = str(school)
+
+        # この校舎に該当するか
+        if any(kw in school_str for kw in school_keywords):
+            if sid not in sid_brands:
+                sid_brands[sid] = set()
+            if brand:
+                sid_brands[sid].add(str(brand))
+
+    wb.close()
+    return sid_brands
+
+
+def filter_billing_by_school(
+    billing_entries: list[tuple[str, str, float]],
+    school_brands: set[str] | None,
+) -> list[tuple[str, str, float]]:
+    """
+    請求明細から、この校舎で受講していないブランドの項目を除外する。
+    school_brands が None の場合はフィルタなし（全項目を返す）。
+
+    設備費・入会金・家族割等のブランド横断項目はフィルタしない。
+    """
+    if school_brands is None:
+        return billing_entries
+
+    # フィルタ不要のカテゴリ（ブランドに依存しない費目）
+    PASSTHROUGH_CATEGORIES = {
+        "設備費", "入会金", "模試代", "家族割", "割引", "過不足金",
+        "諸経費", "家賃", "総合指導管理費", "0", "1",
+        "入会時教材費", "入会時授業料1", "入会時授業料2",
+        "入会時授業料3", "入会時授業料A", "入会時月会費", "入会時設備費",
+    }
+
+    filtered = []
+    for brand, category, amount in billing_entries:
+        # ブランド横断の費目はそのまま通す
+        if category in PASSTHROUGH_CATEGORIES:
+            filtered.append((brand, category, amount))
+            continue
+        # ブランドが空の場合（社割等）はそのまま通す
+        if not brand:
+            filtered.append((brand, category, amount))
+            continue
+        # この校舎で受講しているブランドのみ通す
+        if brand in school_brands:
+            filtered.append((brand, category, amount))
+        # そろばん検定等はブランド名が異なるので部分一致でチェック
+        elif any(sb in brand or brand in sb for sb in school_brands):
+            filtered.append((brand, category, amount))
+
+    return filtered
+
+
+# ====================================================================
 # データ読み込み・集計（コアロジック）
 # ====================================================================
 
@@ -402,21 +517,89 @@ def compare_student(
     return diffs
 
 
+def _find_nearest_class_info(
+    year: int,
+    month: int,
+    class_info_files: dict[tuple[int, int], str],
+) -> str | None:
+    """対象月に最も近いクラス情報ファイルを返す"""
+    if not class_info_files:
+        return None
+    target = year * 12 + month
+    best_path = None
+    best_dist = 9999
+    for (cy, cm), path in class_info_files.items():
+        dist = abs((cy * 12 + cm) - target)
+        if dist < best_dist:
+            best_dist = dist
+            best_path = path
+    return best_path
+
+
+def _load_billing_by_priority(
+    csv_paths_by_priority: list[str],
+) -> dict[str, list[tuple[str, str, float]]]:
+    """
+    複数月のCSVを優先度順に読み込む。
+    csv_paths_by_priority[0] = 対象月（最優先）
+    csv_paths_by_priority[1:] = 前後月（対象月にない生徒のみ補完）
+
+    各生徒の明細は1つの月からのみ取得（合算しない）。
+    対象月にいれば対象月のデータ、いなければ前後月で見つかったデータを使う。
+    """
+    result: dict[str, list[tuple[str, str, float]]] = {}
+
+    for path in csv_paths_by_priority:
+        billing = read_billing_csv(path)
+        for sid, entries in billing.items():
+            if sid not in result:
+                result[sid] = entries
+
+    return result
+
+
+def _get_adjacent_months(
+    year: int, month: int, offset: int,
+) -> list[tuple[int, int]]:
+    """対象月の前後offset月を含むリストを返す"""
+    months = []
+    for delta in range(-offset, offset + 1):
+        m = month + delta
+        y = year
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        months.append((y, m))
+    return months
+
+
 def run_check(
     school_name: str,
     month_label: str,
-    csv_path: str,
+    csv_paths: list[str],
     excel_path: str,
     sheet_index: int = 2,
+    school_brands: dict[str, set[str]] | None = None,
 ) -> list[CheckResult]:
-    """1校舎・1���月分のチェックを実行"""
+    """
+    1校舎・1ヶ月分のチェックを実行。
+    csv_paths: 対象月±2ヶ月分のCSVパスリスト（存在するもののみ）
+    school_brands: {生徒ID: {この校舎で受講しているブランド}} or None
+    """
+    csv_names = [os.path.basename(p) for p in csv_paths]
     print(f"\n{'='*80}")
     print(f"  [{school_name}] {month_label} 照合チェック")
-    print(f"  CSV:   {os.path.basename(csv_path)}")
+    print(f"  CSV:   {csv_names[0]} 他{len(csv_paths)-1}ヶ月分" if len(csv_paths) > 1
+          else f"  CSV:   {csv_names[0]}")
     print(f"  Excel: {os.path.basename(excel_path)}")
+    if school_brands is not None:
+        print(f"  校舎フィルタ: 有効（クラス情報から{len(school_brands)}生徒分）")
     print(f"{'='*80}")
 
-    billing = read_billing_csv(csv_path)
+    billing = _load_billing_by_priority(csv_paths)
     sales = read_excel_sales(excel_path, sheet_index)
 
     ok_count = 0
@@ -445,7 +628,12 @@ def run_check(
                 ))
             continue
 
-        csv_agg = aggregate_csv_for_student(billing[sid])
+        entries = billing[sid]
+        # 校舎フィルタ: この校舎で受講していないブランドの請求を除外
+        if school_brands is not None:
+            student_brands = school_brands.get(sid)
+            entries = filter_billing_by_school(entries, student_brands)
+        csv_agg = aggregate_csv_for_student(entries)
         diffs = compare_student(excel_cols, csv_agg)
 
         if diffs:
@@ -580,13 +768,19 @@ def main():
     config = load_config()
 
     csv_base_dir = config["csv_base_dir"]
+    class_info_dir = config.get("class_info_dir", "")
     output_dir = config.get("output_dir", "C:/Users/USER/Documents/照合結果")
-    schools = [SchoolConfig(**s) for s in config["schools"]]
+    schools = []
+    for s in config["schools"]:
+        s = dict(s)  # コピーして元configを壊さない
+        kw = s.pop("school_keywords", [])
+        schools.append(SchoolConfig(**s, school_keywords=tuple(kw)))
 
     print("=" * 80)
     print("  売上明細 vs 請求データ 照合チェック（全校舎対応）")
     print(f"  実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  対象校舎: {', '.join(s.name for s in schools)}")
+    print(f"  チェック範囲: 対象月 ±2ヶ月")
     print("=" * 80)
 
     # 請求CSV自動検出
@@ -594,6 +788,17 @@ def main():
     print(f"\n  検出された請求CSV: {len(csv_files)}ヶ月分")
     for (y, m), path in sorted(csv_files.items()):
         print(f"    {y}年{m}月 ← {os.path.basename(path)}")
+
+    # クラス情報自動検出
+    class_info_files = {}
+    if class_info_dir:
+        class_info_files = discover_class_info_files(class_info_dir)
+        if class_info_files:
+            print(f"\n  検出されたクラス情報: {len(class_info_files)}ヶ月分")
+            for (y, m), path in sorted(class_info_files.items()):
+                print(f"    {y}年{m}月 ← {os.path.basename(path)}")
+        else:
+            print(f"\n  ⚠ クラス情報が見つかりません: {class_info_dir}")
 
     all_results: list[CheckResult] = []
 
@@ -620,12 +825,32 @@ def main():
         print(f"  マッチした月: {len(pairs)}ヶ月")
 
         for pair in pairs:
+            # 対象月を先頭に、±2ヶ月分のCSVパスを優先度順に収集
+            csv_paths = [pair.csv_path]  # 対象月が最優先
+            adjacent = _get_adjacent_months(pair.year, pair.month, 2)
+            for ym in adjacent:
+                if ym in csv_files and csv_files[ym] != pair.csv_path:
+                    csv_paths.append(csv_files[ym])
+
+            # クラス情報から校舎別ブランドフィルタを構築
+            school_brands = None
+            if school.school_keywords and class_info_files:
+                # 対象月に最も近いクラス情報を使用
+                best_ci = _find_nearest_class_info(
+                    pair.year, pair.month, class_info_files,
+                )
+                if best_ci:
+                    school_brands = read_class_info(
+                        best_ci, school.school_keywords,
+                    )
+
             results = run_check(
                 school_name=school.name,
                 month_label=pair.label,
-                csv_path=pair.csv_path,
+                csv_paths=csv_paths,
                 excel_path=pair.excel_path,
                 sheet_index=school.sheet_index,
+                school_brands=school_brands,
             )
             all_results.extend(results)
 
