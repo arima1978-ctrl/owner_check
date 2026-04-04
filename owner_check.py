@@ -378,6 +378,10 @@ def filter_billing_by_school(
         "入会時授業料3", "入会時授業料A", "入会時月会費", "入会時設備費",
     }
 
+    # BRAND_COLUMN_MAP にあるブランドのみ校舎フィルタ対象
+    # それ以外（学習塾系）はクラス情報に載っていなくても通す
+    FILTERED_BRANDS = set(BRAND_COLUMN_MAP.keys())
+
     filtered = []
     for brand, category, amount in billing_entries:
         # ブランド横断の費目はそのまま通す
@@ -388,11 +392,14 @@ def filter_billing_by_school(
         if not brand:
             filtered.append((brand, category, amount))
             continue
-        # この校舎で受講しているブランドのみ通す
-        if brand in school_brands:
-            filtered.append((brand, category, amount))
-        # そろばん検定等はブランド名が異なるので部分一致でチェック
-        elif any(sb in brand or brand in sb for sb in school_brands):
+        # BRAND_COLUMN_MAP に含まれるブランド → 校舎フィルタで判定
+        if brand in FILTERED_BRANDS:
+            if brand in school_brands:
+                filtered.append((brand, category, amount))
+            elif any(sb in brand or brand in sb for sb in school_brands):
+                filtered.append((brand, category, amount))
+        else:
+            # 学習塾系ブランド → クラス情報になくても通す
             filtered.append((brand, category, amount))
 
     return filtered
