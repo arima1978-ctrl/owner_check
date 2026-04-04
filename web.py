@@ -106,36 +106,50 @@ def run_check_silent(
             csv_total = sum(csv_agg.values())
             total_match = abs(excel_total - csv_total) < 1
 
-            # 売上あり請求なし: 差異のうち Excel>0 かつ CSV=0 の項目があるか
-            has_unbilled = any(
-                ev > 0 and cv == 0 for _, ev, cv, _ in diffs
-            )
-
-            if has_unbilled:
-                no_billing_count += 1
-                rtype = "NO_BILLING"
-            elif total_match:
-                col_only_count += 1
-                rtype = "TOTAL_MATCH"
-            else:
-                total_diff_count += 1
-                rtype = "TOTAL_DIFF"
-
             monthly = _compute_monthly_billing(
                 sid, all_billings, month_col_labels, school_brands,
             )
 
-            results.append(CheckResult(
-                school=school_name,
-                month_label=month_label,
-                result_type=rtype,
-                sid=sid, name=name, row=row_num,
-                diffs=diffs,
-                excel_total=excel_total,
-                csv_total=csv_total,
-                monthly_billing=monthly,
-                month_columns=month_col_labels,
-            ))
+            # 項目レベルで「売上あり請求なし」と「その他の差異」を分離
+            unbilled_diffs = [
+                d for d in diffs if d[1] > 0 and d[2] == 0
+            ]
+            other_diffs = [
+                d for d in diffs if not (d[1] > 0 and d[2] == 0)
+            ]
+
+            if unbilled_diffs:
+                no_billing_count += 1
+                results.append(CheckResult(
+                    school=school_name,
+                    month_label=month_label,
+                    result_type="NO_BILLING",
+                    sid=sid, name=name, row=row_num,
+                    diffs=unbilled_diffs,
+                    excel_total=excel_total,
+                    csv_total=csv_total,
+                    monthly_billing=monthly,
+                    month_columns=month_col_labels,
+                ))
+
+            if other_diffs:
+                if total_match:
+                    col_only_count += 1
+                    rtype = "TOTAL_MATCH"
+                else:
+                    total_diff_count += 1
+                    rtype = "TOTAL_DIFF"
+                results.append(CheckResult(
+                    school=school_name,
+                    month_label=month_label,
+                    result_type=rtype,
+                    sid=sid, name=name, row=row_num,
+                    diffs=other_diffs,
+                    excel_total=excel_total,
+                    csv_total=csv_total,
+                    monthly_billing=monthly,
+                    month_columns=month_col_labels,
+                ))
         else:
             ok_count += 1
 
