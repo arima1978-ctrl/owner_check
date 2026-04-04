@@ -427,17 +427,17 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="tabs">
-            <button class="tab active" onclick="showTab('critical', this)" style="color:#e74c3c">
-                合計不一致（{{ count_critical }}件）
+            <button class="tab active" id="tab-critical" data-tab="critical" onclick="showTab('critical', this)" style="color:#e74c3c">
+                合計不一致（<span class="tab-count">{{ count_critical }}</span>件）
             </button>
-            <button class="tab" onclick="showTab('no_billing', this)" style="color:#8e44ad">
-                売上あり請求なし（{{ count_no_billing }}件）
+            <button class="tab" id="tab-no_billing" data-tab="no_billing" onclick="showTab('no_billing', this)" style="color:#8e44ad">
+                売上あり請求なし（<span class="tab-count">{{ count_no_billing }}</span>件）
             </button>
-            <button class="tab" onclick="showTab('not_csv', this)" style="color:#7f8c8d">
-                月謝未計上（{{ count_not_csv }}件）
+            <button class="tab" id="tab-not_csv" data-tab="not_csv" onclick="showTab('not_csv', this)" style="color:#7f8c8d">
+                月謝未計上（<span class="tab-count">{{ count_not_csv }}</span>件）
             </button>
-            <button class="tab" onclick="showTab('col_only', this)" style="color:#e67e22">
-                列配分違い（{{ count_col_only }}件）
+            <button class="tab" id="tab-col_only" data-tab="col_only" onclick="showTab('col_only', this)" style="color:#e67e22">
+                列配分違い（<span class="tab-count">{{ count_col_only }}</span>件）
             </button>
         </div>
 
@@ -521,11 +521,27 @@ HTML_TEMPLATE = """
     function filterTable() {
         const school = document.getElementById('filterSchool').value;
         const month = document.getElementById('filterMonth').value;
-        document.querySelectorAll('.table-wrap table:not([style*="display: none"]) tbody tr').forEach(tr => {
-            if (tr.querySelector('.empty')) return;
-            const s = tr.getAttribute('data-school') || '';
-            const m = tr.getAttribute('data-month') || '';
-            tr.style.display = (!school || s === school) && (!month || m === month) ? '' : 'none';
+
+        // 全テーブルにフィルタ適用 & 件数カウント
+        const tabNames = ['critical', 'no_billing', 'not_csv', 'col_only'];
+        tabNames.forEach(function(name) {
+            const table = document.getElementById('table-' + name);
+            if (!table) return;
+            let count = 0;
+            table.querySelectorAll('tbody tr').forEach(function(tr) {
+                if (tr.querySelector('.empty')) return;
+                const s = tr.getAttribute('data-school') || '';
+                const m = tr.getAttribute('data-month') || '';
+                const show = (!school || s === school) && (!month || m === month);
+                tr.style.display = show ? '' : 'none';
+                if (show) count++;
+            });
+            // タブの件数を更新
+            const tab = document.getElementById('tab-' + name);
+            if (tab) {
+                const span = tab.querySelector('.tab-count');
+                if (span) span.textContent = count;
+            }
         });
     }
     </script>
