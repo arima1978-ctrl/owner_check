@@ -573,23 +573,33 @@ UPLOAD_TEMPLATE = """
         .header h1 { font-size: 20px; font-weight: 500; }
         .header-right a { color: #aed6f1; font-size: 13px; text-decoration: none; }
         .header-right a:hover { color: white; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        .upload-section { background: white; border-radius: 8px; padding: 24px; margin-bottom: 20px;
-                          box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .upload-section h3 { font-size: 16px; color: #1a5276; margin-bottom: 4px; }
-        .upload-section .desc { font-size: 12px; color: #888; margin-bottom: 16px; }
+        .container { max-width: 960px; margin: 0 auto; padding: 20px; }
+        .section { background: white; border-radius: 8px; padding: 24px; margin-bottom: 20px;
+                   box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .section h3 { font-size: 16px; color: #1a5276; margin-bottom: 4px; }
+        .section .desc { font-size: 12px; color: #888; margin-bottom: 16px; }
         .form-row { margin-bottom: 12px; }
         .form-row label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; }
-        .form-row select, .form-row input[type=file] { font-size: 13px; padding: 6px 10px; }
-        .form-row select { border: 1px solid #ccc; border-radius: 4px; }
+        .form-row select, .form-row input[type=file], .form-row input[type=text] {
+            font-size: 13px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; }
+        .form-row input[type=text] { width: 300px; }
+        .form-inline { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+        .form-inline .form-row { margin-bottom: 0; }
         .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 6px;
                font-size: 14px; cursor: pointer; font-weight: 500; }
+        .btn-sm { padding: 7px 14px; font-size: 12px; }
         .btn-primary { background: #2980b9; color: white; }
         .btn-primary:hover { background: #2471a3; }
+        .btn-outline { background: white; color: #2980b9; border: 1px solid #2980b9; }
+        .btn-outline:hover { background: #eaf2f8; }
         .flash { background: #d4edda; color: #155724; padding: 10px 16px; border-radius: 6px;
                  margin-bottom: 16px; font-size: 13px; }
-        .flash-error { background: #f8d7da; color: #721c24; }
-        .schools-list { font-size: 12px; color: #666; margin-top: 8px; }
+        .file-list { margin-top: 12px; font-size: 12px; color: #555; }
+        .file-list table { border-collapse: collapse; width: 100%; }
+        .file-list th { text-align: left; padding: 4px 8px; background: #f8f9fa; font-weight: 600; }
+        .file-list td { padding: 4px 8px; border-bottom: 1px solid #eee; }
+        .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+        .badge-ok { background: #d4edda; color: #155724; }
     </style>
 </head>
 <body>
@@ -604,42 +614,87 @@ UPLOAD_TEMPLATE = """
         <div class="flash">{{ msg }}</div>
         {% endfor %}
 
-        <div class="upload-section">
+        <!-- 売上明細アップロード -->
+        <div class="section">
             <h3>売上明細の登録</h3>
-            <p class="desc">校舎の売上明細書（Excel）を登録します。ファイルは校舎フォルダに自動配置されます。</p>
+            <p class="desc">校舎の売上明細書（Excel）を登録します。校舎フォルダに自動配置されます。</p>
             <form action="/upload/sales" method="post" enctype="multipart/form-data">
-                <div class="form-row">
-                    <label>校舎を選択:</label>
-                    <select name="school">
-                        {% for s in schools %}<option value="{{ s.name }}">{{ s.name }}</option>{% endfor %}
-                    </select>
+                <div class="form-inline">
+                    <div class="form-row">
+                        <label>校舎:</label>
+                        <select name="school">
+                            {% for s in schools %}<option value="{{ s.name }}">{{ s.name }}</option>{% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label>売上明細Excel:</label>
+                        <input type="file" name="files" accept=".xlsm,.xlsx" multiple required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">登録</button>
                 </div>
-                <div class="form-row">
-                    <label>売上明細Excel (.xlsm / .xlsx):</label>
-                    <input type="file" name="file" accept=".xlsm,.xlsx" required>
-                </div>
-                <button type="submit" class="btn btn-primary">登録</button>
             </form>
-            <div class="schools-list">
-                登録済み校舎フォルダ:
-                {% for s in schools %}{{ s.name }}({{ s.excel_dir }}) {% endfor %}
+
+            {% if sales_files %}
+            <div class="file-list">
+                <p style="font-weight:600; margin-bottom:4px;">登録済み売上ファイル:</p>
+                <table>
+                    <tr><th>校舎</th><th>ファイル</th></tr>
+                    {% for sf in sales_files %}
+                    <tr><td>{{ sf.school }}</td><td>{{ sf.name }}</td></tr>
+                    {% endfor %}
+                </table>
             </div>
+            {% endif %}
         </div>
 
-        <div class="upload-section">
+        <!-- 引落CSV アップロード -->
+        <div class="section">
             <h3>引落結果（請求CSV）の登録</h3>
-            <p class="desc">請求CSVファイルを登録します。送信日フォルダに自動配置されます。</p>
+            <p class="desc">請求CSVファイルを登録します。対象月を選択すると送信日フォルダが自動決定されます。</p>
             <form action="/upload/csv" method="post" enctype="multipart/form-data">
-                <div class="form-row">
-                    <label>請求CSV (.csv):</label>
-                    <input type="file" name="file" accept=".csv" required>
+                <div class="form-inline">
+                    <div class="form-row">
+                        <label>対象月（引落月）:</label>
+                        <select name="year">
+                            {% for y in csv_years %}<option value="{{ y }}" {{ 'selected' if y == current_year else '' }}>{{ y }}年</option>{% endfor %}
+                        </select>
+                        <select name="month">
+                            {% for m in range(1,13) %}<option value="{{ m }}" {{ 'selected' if m == current_month else '' }}>{{ m }}月</option>{% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label>請求CSV:</label>
+                        <input type="file" name="files" accept=".csv" multiple required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">登録</button>
                 </div>
-                <div class="form-row">
-                    <label>送信日フォルダ名 (例: 20260313_送信日):</label>
-                    <input type="text" name="folder_name" placeholder="20260313_送信日"
-                           style="font-size:13px; padding:6px 10px; border:1px solid #ccc; border-radius:4px; width:300px;" required>
+            </form>
+
+            {% if csv_months %}
+            <div class="file-list">
+                <p style="font-weight:600; margin-bottom:4px;">登録済み請求CSV:</p>
+                <table>
+                    <tr><th>対象月</th><th>ファイル</th></tr>
+                    {% for cm in csv_months %}
+                    <tr><td>{{ cm.month }}</td><td>{{ cm.name }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- 新校舎追加 -->
+        <div class="section">
+            <h3>新しい校舎を追加</h3>
+            <p class="desc">照合対象の校舎を追加します。売上フォルダが自動作成されます。</p>
+            <form action="/upload/add_school" method="post">
+                <div class="form-inline">
+                    <div class="form-row">
+                        <label>校舎名:</label>
+                        <input type="text" name="school_name" placeholder="例: 千種" required>
+                    </div>
+                    <button type="submit" class="btn btn-outline btn-sm">追加</button>
                 </div>
-                <button type="submit" class="btn btn-primary">登録</button>
             </form>
         </div>
     </div>
@@ -783,15 +838,44 @@ def upload_page():
     schools = []
     for s in config["schools"]:
         schools.append({"name": s["name"], "excel_dir": s["excel_dir"]})
-    return render_template_string(UPLOAD_TEMPLATE, schools=schools)
+
+    # 登録済み売上ファイル一覧
+    sales_files = []
+    for s in config["schools"]:
+        d = Path(s["excel_dir"])
+        if d.exists():
+            for f in sorted(d.glob("*.xls*")):
+                sales_files.append({"school": s["name"], "name": f.name})
+
+    # 登録済み請求CSV一覧
+    csv_files = discover_csv_files(config["csv_base_dir"])
+    csv_months = []
+    for (y, m), path in sorted(csv_files.items()):
+        csv_months.append({
+            "month": f"{y}年{m}月",
+            "name": os.path.basename(path),
+        })
+
+    now = datetime.now()
+    csv_years = list(range(now.year - 1, now.year + 2))
+
+    return render_template_string(
+        UPLOAD_TEMPLATE,
+        schools=schools,
+        sales_files=sales_files,
+        csv_months=csv_months,
+        csv_years=csv_years,
+        current_year=now.year,
+        current_month=now.month,
+    )
 
 
 @app.route("/upload/sales", methods=["POST"])
 def upload_sales():
     config = load_config()
     school_name = request.form.get("school")
-    file = request.files.get("file")
-    if not file or not school_name:
+    files = request.files.getlist("files")
+    if not files or not school_name:
         flash("ファイルまたは校舎が選択されていません")
         return redirect(url_for("upload_page"))
 
@@ -806,25 +890,81 @@ def upload_sales():
 
     dest_dir = Path(school_cfg["excel_dir"])
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / file.filename
-    file.save(str(dest))
-    flash(f"売上明細を登録しました: {dest}")
+    saved = []
+    for file in files:
+        if file.filename:
+            dest = dest_dir / file.filename
+            file.save(str(dest))
+            saved.append(file.filename)
+    flash(f"売上明細を{len(saved)}件登録しました（{school_name}）: {', '.join(saved)}")
     return redirect(url_for("upload_page"))
 
 
 @app.route("/upload/csv", methods=["POST"])
 def upload_csv():
-    file = request.files.get("file")
-    folder_name = request.form.get("folder_name", "").strip()
-    if not file or not folder_name:
-        flash("ファイルまたはフォルダ名が入力されていません")
+    files = request.files.getlist("files")
+    year = request.form.get("year", "")
+    month = request.form.get("month", "")
+    if not files or not year or not month:
+        flash("対象月またはファイルが選択されていません")
         return redirect(url_for("upload_page"))
+
+    # 対象月 → 送信日フォルダ名を自動生成（対象月-1ヶ月の日付）
+    y, m = int(year), int(month)
+    prev_m = m - 1
+    prev_y = y
+    if prev_m < 1:
+        prev_m = 12
+        prev_y -= 1
+    today = datetime.now().strftime("%d")
+    folder_name = f"{prev_y}{prev_m:02d}{today}_送信日"
 
     dest_dir = UPLOAD_CSV_DIR / folder_name
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / file.filename
-    file.save(str(dest))
-    flash(f"請求CSVを登録しました: {dest}")
+    saved = []
+    for file in files:
+        if file.filename:
+            dest = dest_dir / file.filename
+            file.save(str(dest))
+            saved.append(file.filename)
+    flash(f"{y}年{m}月分の請求CSVを{len(saved)}件登録しました（{folder_name}/）: {', '.join(saved)}")
+    return redirect(url_for("upload_page"))
+
+
+@app.route("/upload/add_school", methods=["POST"])
+def add_school():
+    school_name = request.form.get("school_name", "").strip()
+    if not school_name:
+        flash("校舎名を入力してください")
+        return redirect(url_for("upload_page"))
+
+    config_path = str(Path(__file__).parent / "config.yaml")
+    config = load_config(config_path)
+
+    # 既存チェック
+    for s in config["schools"]:
+        if s["name"] == school_name:
+            flash(f"校舎 '{school_name}' は既に登録されています")
+            return redirect(url_for("upload_page"))
+
+    # config.yaml に追加
+    new_school = {
+        "name": school_name,
+        "excel_dir": f"C:/Users/USER/Documents/{school_name}売上",
+        "excel_pattern": "{name}売上明細書({year}.{month}).xlsm",
+        "sheet_index": 2,
+        "school_keywords": [school_name],
+    }
+    config["schools"].append(new_school)
+
+    import yaml
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+
+    # フォルダ作成
+    Path(new_school["excel_dir"]).mkdir(parents=True, exist_ok=True)
+
+    flash(f"校舎 '{school_name}' を追加しました。売上フォルダ: {new_school['excel_dir']}")
     return redirect(url_for("upload_page"))
 
 
