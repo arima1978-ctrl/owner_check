@@ -40,6 +40,11 @@ from owner_check import (
     _detect_amount_changes,
     KOSHUKAI_COLS,
     RECURRING_COLS,
+    BRAND_COLUMN_MAP,
+    read_all_class_sids,
+    read_mid_month_withdrawals,
+    _get_y_col_details,
+    _map_to_column,
     read_excel_sales,
     read_grades_from_csv,
     aggregate_csv_for_student,
@@ -69,6 +74,8 @@ def run_check_silent(
     withdrawn_sids: set[str] | None = None,
     pair_year: int = 0,
     pair_month: int = 0,
+    all_class_sids: set[str] | None = None,
+    mid_month_withdrawals: dict[str, dict[str, str]] | None = None,
 ) -> tuple[list[CheckResult], dict]:
     """コンソール出力なしで照合チェック"""
     billing = _load_billing_by_priority(csv_paths)
@@ -84,19 +91,37 @@ def run_check_silent(
     not_in_csv_count = 0
     no_billing_count = 0
     withdrawn_count = 0
+    not_enrolled_count = 0
     results: list[CheckResult] = []
 
     _withdrawn = withdrawn_sids or set()
+    _mid_wd = mid_month_withdrawals or {}
 
     for sid, sdata in sorted(sales.items(), key=lambda x: x[1]["row"]):
         name = sdata["name"]
         excel_cols = sdata["cols"]
         row_num = sdata["row"]
 
-        # 退会者なのに売上がある
         excel_total_raw = excel_cols.get("Z", 0)
         if isinstance(excel_total_raw, str):
             excel_total_raw = 0
+
+        # 在籍不明
+        if all_class_sids is not None and sid not in all_class_sids and excel_total_raw > 0:
+            not_enrolled_count += 1
+            results.append(CheckResult(
+                school=school_name,
+                month_label=month_label,
+                result_type="NOT_ENROLLED",
+                sid=sid, name=name, row=row_num,
+                excel_total=excel_total_raw,
+                month_columns=month_col_labels,
+                grade=grades.get(sid, ""),
+                remarks={"Z": "クラス情報に在籍なし（休会・退会・未登録の可能性）"},
+            ))
+            continue
+
+        # 退会者なのに売上がある
         if sid in _withdrawn and excel_total_raw > 0:
             withdrawn_count += 1
             results.append(CheckResult(
@@ -151,6 +176,21 @@ def run_check_silent(
                 monthly, month_col_labels,
             )
 
+            # 当月退会アラート（ブランド単位）
+            mid_wd_col_alerts = {}
+            if sid in _mid_wd:
+                brand_dates = _mid_wd[sid]
+                for wd_brand, wd_date in brand_dates.items():
+                    if wd_brand in BRAND_COLUMN_MAP:
+                        cols = list(BRAND_COLUMN_MAP[wd_brand])
+                    else:
+                        cols = ["E", "F"]
+                    cols.append("D")
+                    msg = f"⚠{wd_brand} {wd_date}退会（金額調整の可能性）"
+                    for c in cols:
+                        if c not in mid_wd_col_alerts:
+                            mid_wd_col_alerts[c] = msg
+
             unbilled_diffs = [
                 d for d in diffs
                 if d[1] > 0 and d[0] != "Y"
@@ -165,6 +205,8 @@ def run_check_silent(
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
                     hints = []
+                    if col in mid_wd_col_alerts:
+                        hints.append(mid_wd_col_alerts[col])
                     koshu = _check_koshukai_alert(
                         sid, col, ev, all_billings,
                         month_col_labels, school_brands,
@@ -207,10 +249,18 @@ def run_check_silent(
                 other_remarks = {}
                 for col, ev, cv, diff in other_diffs:
                     hints = []
+                    if col in mid_wd_col_alerts:
+                        hints.append(mid_wd_col_alerts[col])
                     if col in dropped_alerts:
                         hints.append(dropped_alerts[col])
                     if col in amount_change_alerts:
                         hints.append(amount_change_alerts[col])
+                    if col == "Y" and ev == 0 and cv > 0:
+                        y_details = _get_y_col_details(
+                            sid, all_billings, month_col_labels,
+                        )
+                        if y_details:
+                            hints.append(f"⚠売上未計上: {y_details}")
                     if ev != 0 or cv != 0:
                         search_amt = ev if ev != 0 else cv
                         similar = _find_similar_billing(
@@ -234,7 +284,46 @@ def run_check_silent(
                     grade=grades.get(sid, ""),
                 ))
         else:
-            ok_count += 1
+            # 差異なしでも当月退会ブランドがあればアラート
+            if sid in _mid_wd and excel_total_raw > 0:
+                brand_dates = _mid_wd[sid]
+                wd_remarks = {}
+                wd_diffs = []
+                for wd_brand, wd_date in brand_dates.items():
+                    if wd_brand in BRAND_COLUMN_MAP:
+                        cols = list(BRAND_COLUMN_MAP[wd_brand])
+                    else:
+                        cols = ["E", "F"]
+                    cols.append("D")
+                    msg = f"⚠{wd_brand} {wd_date}退会（金額調整の可能性）"
+                    for c in cols:
+                        ev = excel_cols.get(c, 0)
+                        if isinstance(ev, (int, float)) and ev > 0:
+                            cv = csv_agg.get(c, 0)
+                            wd_diffs.append((c, ev, cv, ev - cv))
+                            wd_remarks[c] = msg
+                if wd_diffs:
+                    monthly = _compute_monthly_billing(
+                        sid, all_billings, month_col_labels, school_brands,
+                    )
+                    results.append(CheckResult(
+                        school=school_name,
+                        month_label=month_label,
+                        result_type="NO_BILLING",
+                        sid=sid, name=name, row=row_num,
+                        diffs=wd_diffs,
+                        excel_total=excel_total_raw,
+                        csv_total=sum(csv_agg.values()),
+                        monthly_billing=monthly,
+                        month_columns=month_col_labels,
+                        remarks=wd_remarks,
+                        grade=grades.get(sid, ""),
+                    ))
+                    no_billing_count += 1
+                else:
+                    ok_count += 1
+            else:
+                ok_count += 1
 
     summary = {
         "total": len(sales),
@@ -243,6 +332,7 @@ def run_check_silent(
         "total_diff": total_diff_count,
         "not_in_csv": not_in_csv_count,
         "no_billing": no_billing_count,
+        "not_enrolled": not_enrolled_count,
         "withdrawn": withdrawn_count,
     }
 
@@ -290,6 +380,8 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
 
             school_brands = None
             withdrawn_sids = None
+            all_class_sids = None
+            mid_month_wd = {}
             if school.school_keywords and class_info_files:
                 best_ci = _find_nearest_class_info(
                     pair.year, pair.month, class_info_files,
@@ -299,6 +391,13 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                         best_ci, school.school_keywords,
                     )
                     withdrawn_sids = read_withdrawn_students(
+                        best_ci, school.school_keywords,
+                        pair.year, pair.month,
+                    )
+                    all_class_sids = read_all_class_sids(
+                        best_ci, school.school_keywords,
+                    )
+                    mid_month_wd = read_mid_month_withdrawals(
                         best_ci, school.school_keywords,
                         pair.year, pair.month,
                     )
@@ -314,6 +413,8 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                 withdrawn_sids=withdrawn_sids,
                 pair_year=pair.year,
                 pair_month=pair.month,
+                all_class_sids=all_class_sids,
+                mid_month_withdrawals=mid_month_wd,
             )
             all_results.extend(results)
             all_summaries.append({
@@ -506,6 +607,10 @@ HTML_TEMPLATE = """
                     <span class="value nobill">{{ s.no_billing }}人</span>
                 </div>
                 <div class="summary-row">
+                    <span class="label">在籍不明</span>
+                    <span class="value warn">{{ s.not_enrolled }}人</span>
+                </div>
+                <div class="summary-row">
                     <span class="label">退会者売上あり</span>
                     <span class="value critical">{{ s.withdrawn }}人</span>
                 </div>
@@ -535,6 +640,9 @@ HTML_TEMPLATE = """
         <div class="tabs">
             <button class="tab active" id="tab-no_billing" data-tab="no_billing" onclick="showTab('no_billing', this)" style="color:#8e44ad">
                 売上あり請求なし（<span class="tab-count">{{ count_no_billing }}</span>件）
+            </button>
+            <button class="tab" id="tab-not_enrolled" data-tab="not_enrolled" onclick="showTab('not_enrolled', this)" style="color:#d35400">
+                在籍不明（<span class="tab-count">{{ count_not_enrolled }}</span>件）
             </button>
             <button class="tab" id="tab-withdrawn" data-tab="withdrawn" onclick="showTab('withdrawn', this)" style="color:#c0392b">
                 退会者売上あり（<span class="tab-count">{{ count_withdrawn }}</span>件）
@@ -586,6 +694,26 @@ HTML_TEMPLATE = """
                 </tbody>
             </table>
             {% endfor %}
+
+            <table id="table-not_enrolled" style="display:none;">
+                <thead>
+                    <tr><th>校舎</th><th>月</th><th>生徒ID</th><th>生徒名</th><th>学年</th>
+                        <th>行</th><th>売上</th><th>備考</th></tr>
+                </thead>
+                <tbody>
+                {% for r in not_enrolled_rows %}
+                    <tr data-school="{{ r.school }}" data-month="{{ r.month }}">
+                        <td>{{ r.school }}</td><td>{{ r.month }}</td>
+                        <td>{{ r.sid }}</td><td>{{ r.name }}</td><td>{{ r.grade }}</td>
+                        <td class="num">{{ r.row }}</td><td class="num">{{ r.excel }}</td>
+                        <td style="font-size:11px; color:#d35400;">{{ r.remark }}</td>
+                    </tr>
+                {% endfor %}
+                {% if not not_enrolled_rows %}
+                    <tr><td colspan="8" class="empty">該当なし</td></tr>
+                {% endif %}
+                </tbody>
+            </table>
 
             <table id="table-withdrawn" style="display:none;">
                 <thead>
@@ -652,7 +780,7 @@ HTML_TEMPLATE = """
         const month = document.getElementById('filterMonth').value;
 
         // 全テーブルにフィルタ適用 & 件数カウント
-        const tabNames = ['no_billing', 'withdrawn', 'not_csv', 'col_only'];
+        const tabNames = ['no_billing', 'not_enrolled', 'withdrawn', 'not_csv', 'col_only'];
         tabNames.forEach(function(name) {
             const table = document.getElementById('table-' + name);
             if (!table) return;
@@ -880,12 +1008,24 @@ def _build_template_data() -> dict:
                 all_month_cols.append(mc)
 
     no_billing_rows = []
+    not_enrolled_rows = []
     withdrawn_rows = []
     not_csv_rows = []
     col_only_rows = []
 
     for r in results:
-        if r.result_type == "WITHDRAWN":
+        if r.result_type == "NOT_ENROLLED":
+            not_enrolled_rows.append({
+                "school": r.school,
+                "month": r.month_label,
+                "sid": r.sid,
+                "name": r.name,
+                "row": r.row,
+                "excel": _format_number(r.excel_total),
+                "grade": r.grade if hasattr(r, "grade") else "",
+                "remark": r.remarks.get("Z", "") if hasattr(r, "remarks") else "",
+            })
+        elif r.result_type == "WITHDRAWN":
             withdrawn_rows.append({
                 "school": r.school,
                 "month": r.month_label,
@@ -927,10 +1067,12 @@ def _build_template_data() -> dict:
         "timestamp": timestamp,
         "all_month_cols": all_month_cols,
         "no_billing_rows": no_billing_rows,
+        "not_enrolled_rows": not_enrolled_rows,
         "withdrawn_rows": withdrawn_rows,
         "not_csv_rows": not_csv_rows,
         "col_only_rows": col_only_rows,
         "count_no_billing": len(no_billing_rows),
+        "count_not_enrolled": len(not_enrolled_rows),
         "count_withdrawn": len(withdrawn_rows),
         "count_not_csv": len(not_csv_rows),
         "count_col_only": len(col_only_rows),

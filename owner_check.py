@@ -317,10 +317,10 @@ def read_mid_month_withdrawals(
     school_keywords: tuple[str, ...],
     target_year: int,
     target_month: int,
-) -> dict[str, str]:
+) -> dict[str, dict[str, str]]:
     """
-    当月中に退会日がある生徒を検出（日割り/回数調整の可能性）。
-    返り値: {生徒ID: "退会日"}
+    当月中または前月末に退会日があるブランドをブランド単位で検出。
+    返り値: {生徒ID: {ブランド名: "退会日"}}
     """
     from datetime import date
     target_first = date(target_year, target_month, 1)
@@ -331,11 +331,12 @@ def read_mid_month_withdrawals(
 
     wb = openpyxl.load_workbook(class_info_path, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
-    result = {}
+    result: dict[str, dict[str, str]] = {}
 
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=False):
         sid_val = row[6].value
         school = row[31].value
+        brand = row[25].value
         taikai = row[21].value
         if sid_val is None or school is None or taikai is None:
             continue
@@ -343,6 +344,7 @@ def read_mid_month_withdrawals(
             continue
 
         sid = str(int(sid_val)) if isinstance(sid_val, (int, float)) else str(sid_val)
+        brand_str = str(brand) if brand else ""
 
         try:
             if hasattr(taikai, "date"):
@@ -351,9 +353,14 @@ def read_mid_month_withdrawals(
                 td = taikai
             else:
                 td = datetime.strptime(str(taikai).split()[0], "%Y-%m-%d").date()
-            # 退会日が当月内
-            if target_first <= td < next_first:
-                result[sid] = str(td)
+            # 退会日が前月末～当月内
+            from datetime import timedelta
+            prev_last = target_first - timedelta(days=1)
+            if td >= prev_last and td < next_first:
+                if sid not in result:
+                    result[sid] = {}
+                if brand_str:
+                    result[sid][brand_str] = str(td)
         except (ValueError, AttributeError):
             pass
 
@@ -1125,10 +1132,22 @@ def run_check(
                 sid, pair_year, pair_month,
                 monthly, month_col_labels,
             )
-            # 当月退会アラート（日割り/回数調整の可能性）
-            mid_wd_alert = ""
+            # 当月退会アラート（ブランド単位・日割り/回数調整の可能性）
+            mid_wd_col_alerts = {}
             if sid in _mid_wd:
-                mid_wd_alert = f"⚠当月{_mid_wd[sid]}退会（金額調整の可能性）"
+                brand_dates = _mid_wd[sid]  # {ブランド名: 退会日}
+                for wd_brand, wd_date in brand_dates.items():
+                    # このブランドがマッピングされる列を特定
+                    if wd_brand in BRAND_COLUMN_MAP:
+                        cols = list(BRAND_COLUMN_MAP[wd_brand])
+                    else:
+                        cols = ["E", "F"]
+                    # 設備費(D)も退会なら0にすべき
+                    cols.append("D")
+                    msg = f"⚠{wd_brand} {wd_date}退会（金額調整の可能性）"
+                    for c in cols:
+                        if c not in mid_wd_col_alerts:
+                            mid_wd_col_alerts[c] = msg
 
             # 項目レベルで「売上あり請求なし」と「その他の差異」を分離
             # 売上>0 かつ 請求額と不一致 → 売上あり請求なし（Y列は対象外）
@@ -1146,8 +1165,8 @@ def run_check(
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
                     hints = []
-                    if mid_wd_alert:
-                        hints.append(mid_wd_alert)
+                    if col in mid_wd_col_alerts:
+                        hints.append(mid_wd_col_alerts[col])
                     # 講習会費アラート
                     koshu = _check_koshukai_alert(
                         sid, col, ev, all_billings,
@@ -1194,8 +1213,8 @@ def run_check(
                 other_remarks = {}
                 for col, ev, cv, diff in other_diffs:
                     hints = []
-                    if mid_wd_alert:
-                        hints.append(mid_wd_alert)
+                    if col in mid_wd_col_alerts:
+                        hints.append(mid_wd_col_alerts[col])
                     if col in dropped_alerts:
                         hints.append(dropped_alerts[col])
                     if col in amount_change_alerts:
@@ -1233,7 +1252,46 @@ def run_check(
                 # unbilledもotherもない（ありえないが安全策）
                 pass
         else:
-            ok_count += 1
+            # 差異なしでも当月退会ブランドがあればアラート
+            if sid in _mid_wd and excel_total_raw > 0:
+                brand_dates = _mid_wd[sid]
+                wd_remarks = {}
+                wd_diffs = []
+                for wd_brand, wd_date in brand_dates.items():
+                    if wd_brand in BRAND_COLUMN_MAP:
+                        cols = list(BRAND_COLUMN_MAP[wd_brand])
+                    else:
+                        cols = ["E", "F"]
+                    cols.append("D")
+                    msg = f"⚠{wd_brand} {wd_date}退会（金額調整の可能性）"
+                    for c in cols:
+                        ev = excel_cols.get(c, 0)
+                        if isinstance(ev, (int, float)) and ev > 0:
+                            cv = csv_agg.get(c, 0)
+                            wd_diffs.append((c, ev, cv, ev - cv))
+                            wd_remarks[c] = msg
+                if wd_diffs:
+                    monthly = _compute_monthly_billing(
+                        sid, all_billings, month_col_labels, school_brands,
+                    )
+                    results.append(CheckResult(
+                        school=school_name,
+                        month_label=month_label,
+                        result_type="NO_BILLING",
+                        sid=sid, name=name, row=row_num,
+                        diffs=wd_diffs,
+                        excel_total=excel_total_raw,
+                        csv_total=sum(csv_agg.values()),
+                        monthly_billing=monthly,
+                        month_columns=month_col_labels,
+                        remarks=wd_remarks,
+                        grade=grades.get(sid, ""),
+                    ))
+                    no_billing_count += 1
+                else:
+                    ok_count += 1
+            else:
+                ok_count += 1
 
     # コンソール出力
     print(f"\n■ 結果サマリー")
