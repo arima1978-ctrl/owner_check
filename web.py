@@ -43,6 +43,7 @@ from owner_check import (
     BRAND_COLUMN_MAP,
     read_all_class_sids,
     read_mid_month_withdrawals,
+    _detect_amount_anomaly,
     _get_y_col_details,
     _map_to_column,
     read_excel_sales,
@@ -323,7 +324,38 @@ def run_check_silent(
                 else:
                     ok_count += 1
             else:
-                ok_count += 1
+                monthly = _compute_monthly_billing(
+                    sid, all_billings, month_col_labels, school_brands,
+                )
+                anomaly_alerts = _detect_amount_anomaly(
+                    sid, pair_month, monthly, month_col_labels, excel_cols,
+                )
+                if anomaly_alerts and excel_total_raw > 0:
+                    anomaly_diffs = []
+                    for col, msg in anomaly_alerts.items():
+                        ev = excel_cols.get(col, 0)
+                        cv = csv_agg.get(col, 0)
+                        if isinstance(ev, (int, float)) and ev > 0:
+                            anomaly_diffs.append((col, ev, cv, ev - cv))
+                    if anomaly_diffs:
+                        no_billing_count += 1
+                        results.append(CheckResult(
+                            school=school_name,
+                            month_label=month_label,
+                            result_type="NO_BILLING",
+                            sid=sid, name=name, row=row_num,
+                            diffs=anomaly_diffs,
+                            excel_total=excel_total_raw,
+                            csv_total=sum(csv_agg.values()),
+                            monthly_billing=monthly,
+                            month_columns=month_col_labels,
+                            remarks=anomaly_alerts,
+                            grade=grades.get(sid, ""),
+                        ))
+                    else:
+                        ok_count += 1
+                else:
+                    ok_count += 1
 
     summary = {
         "total": len(sales),

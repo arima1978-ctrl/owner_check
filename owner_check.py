@@ -976,6 +976,54 @@ def _detect_amount_changes(
     return alerts
 
 
+def _detect_amount_anomaly(
+    sid: str,
+    target_month: int,
+    monthly_billing: dict[str, dict[str, float]],
+    month_col_labels: list[str],
+    excel_cols: dict[str, float],
+) -> dict[str, str]:
+    """
+    金額異常検出: Excel=CSVで一致していても、他の月と比較して
+    金額が大きく変動している場合に警告。
+    前後月の金額と比較し、30%以上の乖離があればアラート。
+    返り値: {列レター: アラートメッセージ}
+    """
+    target_label = f"{target_month}月"
+    alerts = {}
+
+    for col in RECURRING_COLS:
+        curr_val = excel_cols.get(col, 0)
+        if not isinstance(curr_val, (int, float)) or curr_val <= 0:
+            continue
+
+        # 他月の同じ列の金額を収集
+        other_vals = []
+        for label in month_col_labels:
+            if label == target_label:
+                continue
+            agg = monthly_billing.get(label, {})
+            v = agg.get(col, 0)
+            if v > 0:
+                other_vals.append((label, v))
+
+        if not other_vals:
+            continue
+
+        # 他月の代表値（最頻値に近いもの）
+        amounts = [v for _, v in other_vals]
+        median = sorted(amounts)[len(amounts) // 2]
+
+        # 30%以上乖離かつ1000円以上の差
+        if median > 0 and abs(curr_val - median) >= max(median * 0.3, 1000):
+            diff = curr_val - median
+            sign = "+" if diff > 0 else ""
+            ref_months = " / ".join(f"{l}:{v:,.0f}" for l, v in other_vals[:3])
+            alerts[col] = f"⚠金額変動注意: 当月{curr_val:,.0f} vs 他月({ref_months})（{sign}{diff:,.0f}）"
+
+    return alerts
+
+
 def _get_y_col_details(
     sid: str,
     all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
@@ -1291,7 +1339,39 @@ def run_check(
                 else:
                     ok_count += 1
             else:
-                ok_count += 1
+                # 金額異常検出（Excel=CSVでも他月と大きく乖離）
+                monthly = _compute_monthly_billing(
+                    sid, all_billings, month_col_labels, school_brands,
+                )
+                anomaly_alerts = _detect_amount_anomaly(
+                    sid, pair_month, monthly, month_col_labels, excel_cols,
+                )
+                if anomaly_alerts and excel_total_raw > 0:
+                    anomaly_diffs = []
+                    for col, msg in anomaly_alerts.items():
+                        ev = excel_cols.get(col, 0)
+                        cv = csv_agg.get(col, 0)
+                        if isinstance(ev, (int, float)) and ev > 0:
+                            anomaly_diffs.append((col, ev, cv, ev - cv))
+                    if anomaly_diffs:
+                        no_billing_count += 1
+                        results.append(CheckResult(
+                            school=school_name,
+                            month_label=month_label,
+                            result_type="NO_BILLING",
+                            sid=sid, name=name, row=row_num,
+                            diffs=anomaly_diffs,
+                            excel_total=excel_total_raw,
+                            csv_total=sum(csv_agg.values()),
+                            monthly_billing=monthly,
+                            month_columns=month_col_labels,
+                            remarks=anomaly_alerts,
+                            grade=grades.get(sid, ""),
+                        ))
+                    else:
+                        ok_count += 1
+                else:
+                    ok_count += 1
 
     # コンソール出力
     print(f"\n■ 結果サマリー")
