@@ -293,6 +293,74 @@ def read_class_info(
     return sid_brands
 
 
+def read_all_class_sids(
+    class_info_path: str,
+    school_keywords: tuple[str, ...],
+) -> set[str]:
+    """クラス情報に存在する校舎の全生徒IDを返す"""
+    wb = openpyxl.load_workbook(class_info_path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    sids = set()
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=False):
+        sid_val = row[6].value
+        school = row[31].value
+        if sid_val is None or school is None:
+            continue
+        if any(kw in str(school) for kw in school_keywords):
+            sids.add(str(int(sid_val)) if isinstance(sid_val, (int, float)) else str(sid_val))
+    wb.close()
+    return sids
+
+
+def read_mid_month_withdrawals(
+    class_info_path: str,
+    school_keywords: tuple[str, ...],
+    target_year: int,
+    target_month: int,
+) -> dict[str, str]:
+    """
+    当月中に退会日がある生徒を検出（日割り/回数調整の可能性）。
+    返り値: {生徒ID: "退会日"}
+    """
+    from datetime import date
+    target_first = date(target_year, target_month, 1)
+    if target_month == 12:
+        next_first = date(target_year + 1, 1, 1)
+    else:
+        next_first = date(target_year, target_month + 1, 1)
+
+    wb = openpyxl.load_workbook(class_info_path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    result = {}
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=False):
+        sid_val = row[6].value
+        school = row[31].value
+        taikai = row[21].value
+        if sid_val is None or school is None or taikai is None:
+            continue
+        if not any(kw in str(school) for kw in school_keywords):
+            continue
+
+        sid = str(int(sid_val)) if isinstance(sid_val, (int, float)) else str(sid_val)
+
+        try:
+            if hasattr(taikai, "date"):
+                td = taikai.date()
+            elif hasattr(taikai, "year"):
+                td = taikai
+            else:
+                td = datetime.strptime(str(taikai).split()[0], "%Y-%m-%d").date()
+            # 退会日が当月内
+            if target_first <= td < next_first:
+                result[sid] = str(td)
+        except (ValueError, AttributeError):
+            pass
+
+    wb.close()
+    return result
+
+
 def read_withdrawn_students(
     class_info_path: str,
     school_keywords: tuple[str, ...],
@@ -484,6 +552,8 @@ def _map_to_column(brand: str, category: str) -> str | None:
     if category == "模試代":
         return "H"
     if category in ("0", "1"):
+        # 「その他/0」「その他/1」は講習会費やテスト対策費の可能性あり
+        # → Y列にマッピングするが、アラートで別途警告
         return "Y"
     if category in ("入会時教材費", "入会時授業料1", "入会時授業料2",
                      "入会時授業料3", "入会時授業料A", "入会時月会費",
@@ -499,7 +569,7 @@ def _map_to_column(brand: str, category: str) -> str | None:
             return jugyou_col
         if category == "月会費":
             return getsukai_col
-        if category in ("講習��費", "必須講座", "必須講習会", "テスト対策"):
+        if category in ("講習会費", "必須講座", "必須講習会", "テスト対策"):
             if brand.startswith("アンそろばん"):
                 return "Q"
             if brand == "アンプログラミングクラブ":
@@ -509,6 +579,20 @@ def _map_to_column(brand: str, category: str) -> str | None:
             if brand == "アン将棋クラブ":
                 return "W"
             return "I"
+        # カテゴリ空欄でブランド名に「講習会」「検定」が含まれる場合
+        if not category or category == "":
+            if "講習会" in brand:
+                if brand.startswith("アンそろばん"):
+                    return "Q"
+                if "美文字" in brand:
+                    return "T"
+                if "将棋" in brand:
+                    return "W"
+                if "プログラミング" in brand:
+                    return "L"
+                return "I"
+            if "検定" in brand:
+                return "Y"
         return "Y"
 
     # 上記BRAND_COLUMN_MAP以外のブランドは全て学習塾として扱う
@@ -885,6 +969,27 @@ def _detect_amount_changes(
     return alerts
 
 
+def _get_y_col_details(
+    sid: str,
+    all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
+    month_col_labels: list[str],
+) -> str:
+    """Y列(その他)にマッピングされるCSV明細の内訳を返す"""
+    details = []
+    for label in month_col_labels:
+        billing = all_billings.get(label, {})
+        entries = billing.get(sid, [])
+        for brand, category, amount in entries:
+            if amount == 0:
+                continue
+            mapped = _map_to_column(brand, category)
+            if mapped == "Y":
+                details.append(f"{label}「{brand}/{category}」{amount:,.0f}")
+    if details:
+        return " / ".join(details[:5])
+    return ""
+
+
 def run_check(
     school_name: str,
     month_label: str,
@@ -896,6 +1001,8 @@ def run_check(
     withdrawn_sids: set[str] | None = None,
     pair_year: int = 0,
     pair_month: int = 0,
+    all_class_sids: set[str] | None = None,
+    mid_month_withdrawals: dict[str, str] | None = None,
 ) -> list[CheckResult]:
     """
     1校舎・1ヶ月分のチェックを実行。
@@ -928,19 +1035,36 @@ def run_check(
     not_in_csv_count = 0
     no_billing_count = 0
     withdrawn_count = 0
+    not_enrolled_count = 0
     results: list[CheckResult] = []
 
     _withdrawn = withdrawn_sids or set()
+    _mid_wd = mid_month_withdrawals or {}
 
     for sid, sdata in sorted(sales.items(), key=lambda x: x[1]["row"]):
         name = sdata["name"]
         excel_cols = sdata["cols"]
         row_num = sdata["row"]
 
-        # 退会者なのに売上がある
+        # 在籍不明（クラス情報に存在しない生徒に売上がある）
         excel_total_raw = excel_cols.get("Z", 0)
         if isinstance(excel_total_raw, str):
             excel_total_raw = 0
+        if all_class_sids is not None and sid not in all_class_sids and excel_total_raw > 0:
+            not_enrolled_count += 1
+            results.append(CheckResult(
+                school=school_name,
+                month_label=month_label,
+                result_type="NOT_ENROLLED",
+                sid=sid, name=name, row=row_num,
+                excel_total=excel_total_raw,
+                month_columns=month_col_labels,
+                grade=grades.get(sid, ""),
+                remarks={"Z": "クラス情報に在籍なし（休会・退会・未登録の可能性）"},
+            ))
+            continue
+
+        # 退会者なのに売上がある
         if sid in _withdrawn and excel_total_raw > 0:
             withdrawn_count += 1
             results.append(CheckResult(
@@ -1001,6 +1125,10 @@ def run_check(
                 sid, pair_year, pair_month,
                 monthly, month_col_labels,
             )
+            # 当月退会アラート（日割り/回数調整の可能性）
+            mid_wd_alert = ""
+            if sid in _mid_wd:
+                mid_wd_alert = f"⚠当月{_mid_wd[sid]}退会（金額調整の可能性）"
 
             # 項目レベルで「売上あり請求なし」と「その他の差異」を分離
             # 売上>0 かつ 請求額と不一致 → 売上あり請求なし（Y列は対象外）
@@ -1018,6 +1146,8 @@ def run_check(
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
                     hints = []
+                    if mid_wd_alert:
+                        hints.append(mid_wd_alert)
                     # 講習会費アラート
                     koshu = _check_koshukai_alert(
                         sid, col, ev, all_billings,
@@ -1064,10 +1194,19 @@ def run_check(
                 other_remarks = {}
                 for col, ev, cv, diff in other_diffs:
                     hints = []
+                    if mid_wd_alert:
+                        hints.append(mid_wd_alert)
                     if col in dropped_alerts:
                         hints.append(dropped_alerts[col])
                     if col in amount_change_alerts:
                         hints.append(amount_change_alerts[col])
+                    # Y列(その他)でCSV>0、Excel=0の場合、CSVの内訳を表示
+                    if col == "Y" and ev == 0 and cv > 0:
+                        y_details = _get_y_col_details(
+                            sid, all_billings, month_col_labels,
+                        )
+                        if y_details:
+                            hints.append(f"⚠売上未計上: {y_details}")
                     if ev != 0 or cv != 0:
                         search_amt = ev if ev != 0 else cv
                         similar = _find_similar_billing(
@@ -1307,6 +1446,8 @@ def main():
             # クラス情報から校舎別ブランドフィルタ＋退会者リストを構築
             school_brands = None
             withdrawn_sids = None
+            all_class_sids = None
+            mid_month_wd = {}
             if school.school_keywords and class_info_files:
                 best_ci = _find_nearest_class_info(
                     pair.year, pair.month, class_info_files,
@@ -1316,6 +1457,13 @@ def main():
                         best_ci, school.school_keywords,
                     )
                     withdrawn_sids = read_withdrawn_students(
+                        best_ci, school.school_keywords,
+                        pair.year, pair.month,
+                    )
+                    all_class_sids = read_all_class_sids(
+                        best_ci, school.school_keywords,
+                    )
+                    mid_month_wd = read_mid_month_withdrawals(
                         best_ci, school.school_keywords,
                         pair.year, pair.month,
                     )
@@ -1331,6 +1479,8 @@ def main():
                 withdrawn_sids=withdrawn_sids,
                 pair_year=pair.year,
                 pair_month=pair.month,
+                all_class_sids=all_class_sids,
+                mid_month_withdrawals=mid_month_wd,
             )
             all_results.extend(results)
 
