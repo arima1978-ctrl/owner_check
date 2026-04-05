@@ -737,6 +737,154 @@ def _find_similar_billing(
     return ""
 
 
+# 講習会費系の列
+KOSHUKAI_COLS = {"G", "I", "L", "Q", "T", "W"}
+
+# 定期費用の列（差額請求チェック対象）
+RECURRING_COLS = {"D", "E", "F", "J", "K", "M", "N", "O", "P", "R", "S", "U", "V"}
+
+
+def _check_koshukai_alert(
+    sid: str,
+    col: str,
+    excel_amount: float,
+    all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
+    month_col_labels: list[str],
+    school_brands: dict[str, set[str]] | None,
+) -> str:
+    """
+    講習会費アラート: 講習会費列で売上>0だがCSV=0の場合、
+    全月の請求から同額を探す。見つかれば「○月に同額請求あり」、
+    なければ「該当請求なし（要確認）」。
+    """
+    if col not in KOSHUKAI_COLS or excel_amount <= 0:
+        return ""
+
+    for label in month_col_labels:
+        billing = all_billings.get(label, {})
+        entries = billing.get(sid, [])
+        if school_brands is not None:
+            student_brands = school_brands.get(sid)
+            if student_brands is not None:
+                entries = filter_billing_by_school(entries, student_brands)
+        agg = aggregate_csv_for_student(entries)
+        if abs(agg.get(col, 0) - excel_amount) < 1:
+            return f"⚡{label}に同額請求あり"
+
+    return "⚠該当請求なし（要確認）"
+
+
+def _detect_dropped_brands(
+    sid: str,
+    target_year: int,
+    target_month: int,
+    all_billings: dict[str, dict[str, list[tuple[str, str, float]]]],
+    month_col_labels: list[str],
+) -> dict[str, str]:
+    """
+    退会/コース変更検出: 前月にあったブランドが当月になくなった場合を検出。
+    返り値: {列レター: アラートメッセージ}
+    """
+    target_label = f"{target_month}月"
+
+    # 前月ラベルを特定
+    prev_month = target_month - 1
+    prev_year = target_year
+    if prev_month < 1:
+        prev_month = 12
+        prev_year -= 1
+    prev_label = f"{prev_month}月"
+
+    if prev_label not in month_col_labels or target_label not in month_col_labels:
+        return {}
+
+    # 各月のブランド別金額を集計
+    def get_brand_amounts(label):
+        billing = all_billings.get(label, {})
+        entries = billing.get(sid, [])
+        brands = {}
+        for brand, category, amount in entries:
+            if not brand or category in ("設備費", "入会金", "0", "1",
+                                          "入会時教材費", "入会時授業料1",
+                                          "入会時授業料2", "入会時授業料3",
+                                          "入会時授業料A", "入会時月会費",
+                                          "入会時設備費", "家族割", "割引",
+                                          "過不足金", "諸経費", "家賃",
+                                          "総合指導管理費"):
+                continue
+            if brand not in brands:
+                brands[brand] = 0
+            brands[brand] += amount
+        return {b: a for b, a in brands.items() if a > 0}
+
+    prev_brands = get_brand_amounts(prev_label)
+    curr_brands = get_brand_amounts(target_label)
+
+    if not prev_brands:
+        return {}
+
+    dropped = set(prev_brands.keys()) - set(curr_brands.keys())
+    if not dropped:
+        return {}
+
+    all_dropped = len(curr_brands) == 0
+
+    alerts = {}
+    for brand in dropped:
+        # このブランドがマッピングされる列を特定
+        if brand in BRAND_COLUMN_MAP:
+            cols = list(BRAND_COLUMN_MAP[brand])
+        else:
+            cols = ["E", "F"]
+
+        if all_dropped:
+            msg = f"⚠{prev_month}月まで請求あり→{target_month}月から全コースなし（退会の可能性）"
+        else:
+            remaining = ", ".join(sorted(curr_brands.keys()))
+            msg = f"⚠{prev_month}月まで{brand}請求あり→{target_month}月からなし（コース変更？残:{remaining}）"
+
+        for col in cols:
+            alerts[col] = msg
+
+    return alerts
+
+
+def _detect_amount_changes(
+    sid: str,
+    target_year: int,
+    target_month: int,
+    monthly_billing: dict[str, dict[str, float]],
+    month_col_labels: list[str],
+) -> dict[str, str]:
+    """
+    差額請求アラート: 定期費用が前月と当月で金額が変わった場合に警告。
+    返り値: {列レター: アラートメッセージ}
+    """
+    target_label = f"{target_month}月"
+    prev_month = target_month - 1
+    if prev_month < 1:
+        prev_month = 12
+    prev_label = f"{prev_month}月"
+
+    if prev_label not in month_col_labels or target_label not in month_col_labels:
+        return {}
+
+    prev_agg = monthly_billing.get(prev_label, {})
+    curr_agg = monthly_billing.get(target_label, {})
+
+    alerts = {}
+    for col in RECURRING_COLS:
+        pv = prev_agg.get(col, 0)
+        cv = curr_agg.get(col, 0)
+        if pv > 0 and cv > 0 and abs(pv - cv) >= 1:
+            diff = cv - pv
+            sign = "+" if diff > 0 else ""
+            col_name = COL_DISPLAY.get(col, col)
+            alerts[col] = f"💰前月{pv:,.0f}→当月{cv:,.0f}（{sign}{diff:,.0f} 差額請求の可能性）"
+
+    return alerts
+
+
 def run_check(
     school_name: str,
     month_label: str,
@@ -746,6 +894,8 @@ def run_check(
     sheet_index: int = 2,
     school_brands: dict[str, set[str]] | None = None,
     withdrawn_sids: set[str] | None = None,
+    pair_year: int = 0,
+    pair_month: int = 0,
 ) -> list[CheckResult]:
     """
     1校舎・1ヶ月分のチェックを実行。
@@ -841,6 +991,17 @@ def run_check(
                 sid, all_billings, month_col_labels, school_brands,
             )
 
+            # 退会/コース変更検出（請求ベース）
+            dropped_alerts = _detect_dropped_brands(
+                sid, pair_year, pair_month,
+                all_billings, month_col_labels,
+            )
+            # 差額請求アラート
+            amount_change_alerts = _detect_amount_changes(
+                sid, pair_year, pair_month,
+                monthly, month_col_labels,
+            )
+
             # 項目レベルで「売上あり請求なし」と「その他の差異」を分離
             # 売上>0 かつ 請求額と不一致 → 売上あり請求なし（Y列は対象外）
             unbilled_diffs = [
@@ -854,14 +1015,31 @@ def run_check(
 
             if unbilled_diffs:
                 no_billing_count += 1
-                # 備考: 前後月で同額/近似額の請求を探す
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
-                    hint = _find_similar_billing(
-                        sid, ev, all_billings, month_col_labels, col,
+                    hints = []
+                    # 講習会費アラート
+                    koshu = _check_koshukai_alert(
+                        sid, col, ev, all_billings,
+                        month_col_labels, school_brands,
                     )
-                    if hint:
-                        remarks[col] = hint
+                    if koshu:
+                        hints.append(koshu)
+                    # 退会/コース変更アラート
+                    if col in dropped_alerts:
+                        hints.append(dropped_alerts[col])
+                    # 差額請求アラート
+                    if col in amount_change_alerts:
+                        hints.append(amount_change_alerts[col])
+                    # 類似請求検索（講習会費以外）
+                    if col not in KOSHUKAI_COLS:
+                        similar = _find_similar_billing(
+                            sid, ev, all_billings, month_col_labels, col,
+                        )
+                        if similar:
+                            hints.append(similar)
+                    if hints:
+                        remarks[col] = " / ".join(hints)
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -883,16 +1061,22 @@ def run_check(
                 else:
                     total_diff_count += 1
                     rtype = "TOTAL_DIFF"
-                # 備考: 差異がある項目について類似請求を探す
                 other_remarks = {}
                 for col, ev, cv, diff in other_diffs:
+                    hints = []
+                    if col in dropped_alerts:
+                        hints.append(dropped_alerts[col])
+                    if col in amount_change_alerts:
+                        hints.append(amount_change_alerts[col])
                     if ev != 0 or cv != 0:
                         search_amt = ev if ev != 0 else cv
-                        hint = _find_similar_billing(
+                        similar = _find_similar_billing(
                             sid, search_amt, all_billings, month_col_labels, col,
                         )
-                        if hint:
-                            other_remarks[col] = hint
+                        if similar:
+                            hints.append(similar)
+                    if hints:
+                        other_remarks[col] = " / ".join(hints)
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -1145,6 +1329,8 @@ def main():
                 sheet_index=school.sheet_index,
                 school_brands=school_brands,
                 withdrawn_sids=withdrawn_sids,
+                pair_year=pair.year,
+                pair_month=pair.month,
             )
             all_results.extend(results)
 

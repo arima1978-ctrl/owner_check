@@ -35,6 +35,11 @@ from owner_check import (
     _preload_all_billings,
     _compute_monthly_billing,
     _find_similar_billing,
+    _check_koshukai_alert,
+    _detect_dropped_brands,
+    _detect_amount_changes,
+    KOSHUKAI_COLS,
+    RECURRING_COLS,
     read_excel_sales,
     read_grades_from_csv,
     aggregate_csv_for_student,
@@ -62,6 +67,8 @@ def run_check_silent(
     sheet_index: int = 2,
     school_brands: dict[str, set[str]] | None = None,
     withdrawn_sids: set[str] | None = None,
+    pair_year: int = 0,
+    pair_month: int = 0,
 ) -> tuple[list[CheckResult], dict]:
     """コンソール出力なしで照合チェック"""
     billing = _load_billing_by_priority(csv_paths)
@@ -135,8 +142,15 @@ def run_check_silent(
                 sid, all_billings, month_col_labels, school_brands,
             )
 
-            # 項目レベルで「売上あり請求なし」と「その他の差異」を分離
-            # 売上>0 かつ 請求額と不一致 → 売上あり請求なし（Y列は対象外）
+            dropped_alerts = _detect_dropped_brands(
+                sid, pair_year, pair_month,
+                all_billings, month_col_labels,
+            )
+            amount_change_alerts = _detect_amount_changes(
+                sid, pair_year, pair_month,
+                monthly, month_col_labels,
+            )
+
             unbilled_diffs = [
                 d for d in diffs
                 if d[1] > 0 and d[0] != "Y"
@@ -150,11 +164,25 @@ def run_check_silent(
                 no_billing_count += 1
                 remarks = {}
                 for col, ev, cv, diff in unbilled_diffs:
-                    hint = _find_similar_billing(
-                        sid, ev, all_billings, month_col_labels, col,
+                    hints = []
+                    koshu = _check_koshukai_alert(
+                        sid, col, ev, all_billings,
+                        month_col_labels, school_brands,
                     )
-                    if hint:
-                        remarks[col] = hint
+                    if koshu:
+                        hints.append(koshu)
+                    if col in dropped_alerts:
+                        hints.append(dropped_alerts[col])
+                    if col in amount_change_alerts:
+                        hints.append(amount_change_alerts[col])
+                    if col not in KOSHUKAI_COLS:
+                        similar = _find_similar_billing(
+                            sid, ev, all_billings, month_col_labels, col,
+                        )
+                        if similar:
+                            hints.append(similar)
+                    if hints:
+                        remarks[col] = " / ".join(hints)
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -178,13 +206,20 @@ def run_check_silent(
                     rtype = "TOTAL_DIFF"
                 other_remarks = {}
                 for col, ev, cv, diff in other_diffs:
+                    hints = []
+                    if col in dropped_alerts:
+                        hints.append(dropped_alerts[col])
+                    if col in amount_change_alerts:
+                        hints.append(amount_change_alerts[col])
                     if ev != 0 or cv != 0:
                         search_amt = ev if ev != 0 else cv
-                        hint = _find_similar_billing(
+                        similar = _find_similar_billing(
                             sid, search_amt, all_billings, month_col_labels, col,
                         )
-                        if hint:
-                            other_remarks[col] = hint
+                        if similar:
+                            hints.append(similar)
+                    if hints:
+                        other_remarks[col] = " / ".join(hints)
                 results.append(CheckResult(
                     school=school_name,
                     month_label=month_label,
@@ -277,6 +312,8 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
                 sheet_index=school.sheet_index,
                 school_brands=school_brands,
                 withdrawn_sids=withdrawn_sids,
+                pair_year=pair.year,
+                pair_month=pair.month,
             )
             all_results.extend(results)
             all_summaries.append({
