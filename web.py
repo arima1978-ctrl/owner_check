@@ -391,8 +391,12 @@ def run_check_silent(
     return results, summary
 
 
-def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
-    """全校舎・全月の照合を実行"""
+def run_all_checks(
+    school_filter: str | None = None,
+    year_filter: int | None = None,
+    month_filter: int | None = None,
+) -> tuple[list[CheckResult], list[dict]]:
+    """照合を実行。school_filter/year_filter/month_filter 指定で絞り込み可。"""
     config = load_config()
     csv_base_dir = config["csv_base_dir"]
     class_info_dir = config.get("class_info_dir", "")
@@ -401,6 +405,10 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
         s = dict(s)
         kw = s.pop("school_keywords", [])
         schools.append(SchoolConfig(**s, school_keywords=tuple(kw)))
+
+    # 校舎フィルタ
+    if school_filter:
+        schools = [s for s in schools if s.name == school_filter]
 
     csv_files = discover_csv_files(csv_base_dir)
     class_info_files = {}
@@ -416,6 +424,9 @@ def run_all_checks() -> tuple[list[CheckResult], list[dict]]:
             continue
 
         pairs = match_months(csv_files, excel_files)
+        # 年月フィルタ
+        if year_filter and month_filter:
+            pairs = [p for p in pairs if p.year == year_filter and p.month == month_filter]
         for pair in pairs:
             csv_paths = [pair.csv_path]
             adjacent = _get_adjacent_months(pair.year, pair.month, 2)
@@ -625,10 +636,19 @@ HTML_TEMPLATE = """
         {% endfor %}
 
         <div class="actions">
-            <a href="/run" class="btn btn-primary" id="runBtn"
-               onclick="this.textContent='チェック実行中...'; this.classList.add('btn-loading');">
-                照合チェック実行
-            </a>
+            <form action="/run" method="get" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;"
+                  onsubmit="var b=document.getElementById('runBtn'); b.textContent='チェック実行中...'; b.classList.add('btn-loading');">
+                <label>校舎:</label>
+                <select name="school">
+                    <option value="">すべて</option>
+                    {% for s in config_school_names %}
+                    <option value="{{ s }}" {% if s == selected_school %}selected{% endif %}>{{ s }}</option>
+                    {% endfor %}
+                </select>
+                <label>月:</label>
+                <input type="month" name="month" value="{{ selected_month }}">
+                <button type="submit" class="btn btn-primary" id="runBtn">照合チェック実行</button>
+            </form>
             {% if results %}
             <a href="/download" class="btn btn-success">CSV ダウンロード</a>
             {% endif %}
@@ -1011,7 +1031,8 @@ UPLOAD_TEMPLATE = """
 # ルーティング
 # ====================================================================
 
-_cache: dict = {"results": None, "summaries": None, "timestamp": None}
+_cache: dict = {"results": None, "summaries": None, "timestamp": None,
+                "selected_school": "", "selected_month": ""}
 
 
 def _format_number(val: float) -> str:
@@ -1052,9 +1073,21 @@ def _build_template_data() -> dict:
     summaries = _cache["summaries"]
     timestamp = _cache["timestamp"]
 
+    # 設定から校舎一覧を取得（結果未取得時もドロップダウン表示用）
+    try:
+        cfg = load_config()
+        config_school_names = [s["name"] for s in cfg.get("schools", [])]
+    except Exception:
+        config_school_names = []
+    selected_school = _cache.get("selected_school", "")
+    selected_month = _cache.get("selected_month", "")
+
     if results is None:
         return {"results": None, "summaries": None, "timestamp": None,
-                "all_month_cols": []}
+                "all_month_cols": [],
+                "config_school_names": config_school_names,
+                "selected_school": selected_school,
+                "selected_month": selected_month}
 
     # 全結果から月カラム収集
     all_month_cols = []
@@ -1134,6 +1167,9 @@ def _build_template_data() -> dict:
         "count_col_only": len(col_only_rows),
         "school_names": school_names,
         "month_names": month_names,
+        "config_school_names": config_school_names,
+        "selected_school": selected_school,
+        "selected_month": selected_month,
     }
 
 
@@ -1145,10 +1181,27 @@ def index():
 
 @app.route("/run")
 def run():
-    results, summaries = run_all_checks()
+    school = request.args.get("school", "").strip() or None
+    month_str = request.args.get("month", "").strip()  # "YYYY-MM"
+    year_f, month_f = None, None
+    if month_str:
+        try:
+            y, m = month_str.split("-")
+            year_f, month_f = int(y), int(m)
+        except ValueError:
+            flash(f"月の形式が不正です: {month_str}")
+            return redirect(url_for("index"))
+    results, summaries = run_all_checks(
+        school_filter=school, year_filter=year_f, month_filter=month_f,
+    )
     _cache["results"] = results
     _cache["summaries"] = summaries
     _cache["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _cache["selected_school"] = school or ""
+    _cache["selected_month"] = month_str
+    if not results:
+        scope = f"{school or '全校舎'} {month_str or '全期間'}"
+        flash(f"照合対象が見つかりませんでした ({scope})。売上Excelと請求CSVの配置を確認してください。")
     return redirect(url_for("index"))
 
 
