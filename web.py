@@ -937,7 +937,7 @@ UPLOAD_TEMPLATE = """
         <!-- 売上明細アップロード -->
         <div class="section">
             <h3>売上明細の登録</h3>
-            <p class="desc">校舎の売上明細書（Excel）を登録します。校舎フォルダに自動配置されます。</p>
+            <p class="desc">校舎・対象月を指定して売上明細書（Excel）を登録します。ファイル名は自動で <code>{校舎名}売上明細書(YYYY.MM).xlsm</code> にリネーム保存されます。</p>
             <form action="/upload/sales" method="post" enctype="multipart/form-data">
                 <div class="form-inline">
                     <div class="form-row">
@@ -947,8 +947,17 @@ UPLOAD_TEMPLATE = """
                         </select>
                     </div>
                     <div class="form-row">
+                        <label>対象月:</label>
+                        <select name="year">
+                            {% for y in csv_years %}<option value="{{ y }}" {{ 'selected' if y == current_year else '' }}>{{ y }}年</option>{% endfor %}
+                        </select>
+                        <select name="month">
+                            {% for m in range(1,13) %}<option value="{{ m }}" {{ 'selected' if m == current_month else '' }}>{{ m }}月</option>{% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-row">
                         <label>売上明細Excel:</label>
-                        <input type="file" name="files" accept=".xlsm,.xlsx" multiple required>
+                        <input type="file" name="files" accept=".xlsm,.xlsx" required>
                     </div>
                     <button type="submit" class="btn btn-primary">登録</button>
                 </div>
@@ -1261,9 +1270,18 @@ def upload_page():
 def upload_sales():
     config = load_config()
     school_name = request.form.get("school")
+    year = request.form.get("year", "").strip()
+    month = request.form.get("month", "").strip()
     files = request.files.getlist("files")
-    if not files or not school_name:
-        flash("ファイルまたは校舎が選択されていません")
+    if not files or not school_name or not year or not month:
+        flash("ファイル・校舎・対象月をすべて指定してください")
+        return redirect(url_for("upload_page"))
+
+    try:
+        y = int(year)
+        m = int(month)
+    except ValueError:
+        flash(f"対象月の形式が不正です: {year}/{month}")
         return redirect(url_for("upload_page"))
 
     school_cfg = None
@@ -1277,13 +1295,22 @@ def upload_sales():
 
     dest_dir = Path(school_cfg["excel_dir"])
     dest_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for file in files:
-        if file.filename:
-            dest = dest_dir / file.filename
-            file.save(str(dest))
-            saved.append(file.filename)
-    flash(f"売上明細を{len(saved)}件登録しました（{school_name}）: {', '.join(saved)}")
+    file = files[0]
+    if not file.filename:
+        flash("ファイルが空です")
+        return redirect(url_for("upload_page"))
+
+    # 拡張子は元ファイルを踏襲（xlsm/xlsx）
+    ext = Path(file.filename).suffix.lower()
+    if ext not in (".xlsm", ".xlsx"):
+        flash(f"対応していない拡張子: {ext}")
+        return redirect(url_for("upload_page"))
+
+    # 規格準拠のファイル名でリネーム保存 (owner_check.py の regex \((\d{4})\.(\d{2})\) に合致)
+    canonical = f"{school_name}売上明細書({y:04d}.{m:02d}){ext}"
+    dest = dest_dir / canonical
+    file.save(str(dest))
+    flash(f"売上明細を登録しました（{school_name} {y}年{m}月）: {canonical}")
     return redirect(url_for("upload_page"))
 
 
