@@ -1,0 +1,16 @@
+[Unit]
+Description=Owner Check Web App (Sales Reconciliation)
+After=network.target
+
+[Service]
+Type=simple
+User=skyuser
+WorkingDirectory=/home/skyuser/owner_check
+ExecStart=/home/skyuser/owner_check/venv/bin/python3 web.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/skyuser/owner_check/web.log
+StandardError=append:/home/skyuser/owner_check/web.log
+
+[Install]
+WantedBy=multi-user.target

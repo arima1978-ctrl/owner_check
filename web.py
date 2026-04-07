@@ -56,8 +56,28 @@ from owner_check import (
 app = Flask(__name__)
 app.secret_key = "owner_check_secret_key"
 
-UPLOAD_SALES_DIR = Path("C:/Users/USER/Documents")
-UPLOAD_CSV_DIR = Path("Y:/_★20170701作業用/100 真由美/野田より/◆日にち別お仕事◆")
+
+def _load_web_settings() -> dict:
+    """config.yaml の web: セクションを読み込む。未定義ならデフォルト。"""
+    import yaml
+    cfg_path = Path(__file__).parent / "config.yaml"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        cfg = {}
+    web_cfg = cfg.get("web") or {}
+    return {
+        "upload_sales_dir": Path(web_cfg.get("upload_sales_dir", "./data/schools")),
+        "upload_csv_dir": Path(web_cfg.get("upload_csv_dir", "./data/csv")),
+        "port": int(web_cfg.get("port", 3006)),
+    }
+
+
+_WEB_SETTINGS = _load_web_settings()
+UPLOAD_SALES_DIR = _WEB_SETTINGS["upload_sales_dir"]
+UPLOAD_CSV_DIR = _WEB_SETTINGS["upload_csv_dir"]
+WEB_PORT = _WEB_SETTINGS["port"]
 
 
 # ====================================================================
@@ -1281,8 +1301,8 @@ def add_school():
 if __name__ == "__main__":
     print("=" * 60)
     print("  売上照合チェック Webアプリ")
-    print("  ブラウザで http://localhost:3006 にアクセス")
-    print("  社内LAN: http://<このPCのIP>:3006")
+    print(f"  ブラウザで http://localhost:{WEB_PORT} にアクセス")
+    print(f"  社内LAN: http://<このPCのIP>:{WEB_PORT}")
     print("  停止: Ctrl+C")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=3006, debug=False, load_dotenv=False)
+    app.run(host="0.0.0.0", port=WEB_PORT, debug=False, load_dotenv=False)
