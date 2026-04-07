@@ -612,14 +612,52 @@ def _map_to_column(brand: str, category: str) -> str | None:
     return "Y"
 
 
+def _score_sales_sheet(ws) -> int:
+    """売上明細シートらしさを数える。行5以降で B列=数値ID かつ C列=氏名 の行数。"""
+    score = 0
+    max_scan = min(ws.max_row, 400)
+    for row in ws.iter_rows(min_row=5, max_row=max_scan, values_only=True):
+        if len(row) < 3:
+            continue
+        a_val, b_val, c_val = row[0], row[1], row[2]
+        if a_val is not None and isinstance(a_val, str) and "計" in a_val:
+            break
+        if isinstance(b_val, (int, float)) and isinstance(c_val, str) and c_val.strip():
+            score += 1
+    return score
+
+
+def detect_sales_sheet_index(excel_path: str) -> int | None:
+    """ブック内から売上明細シートを自動検出。5人未満しか見つからなければ None。"""
+    wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+    try:
+        best_idx, best_score = None, 0
+        for i, name in enumerate(wb.sheetnames):
+            s = _score_sales_sheet(wb[name])
+            if s > best_score:
+                best_idx, best_score = i, s
+        return best_idx if best_score >= 5 else None
+    finally:
+        wb.close()
+
+
 def read_excel_sales(
     excel_path: str,
-    sheet_index: int = 2,
+    sheet_index: int | None = 2,
 ) -> dict[str, dict]:
     """
     売上明細Excelを読み込む。
+    sheet_index が None または負値なら自動検出する。
+    指定したインデックスがレイアウト不一致でも自動検出にフォールバック。
     返り値: {生徒ID: {"name": 生徒名, "cols": {列レター: 金額}, "row": 行番号}}
     """
+    if sheet_index is None or (isinstance(sheet_index, int) and sheet_index < 0):
+        detected = detect_sales_sheet_index(excel_path)
+        if detected is None:
+            print(f"  警告: 売上明細シートを自動検出できませんでした: {excel_path}")
+            return {}
+        sheet_index = detected
+
     wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
 
     if sheet_index >= len(wb.sheetnames):
@@ -628,6 +666,17 @@ def read_excel_sales(
         return {}
 
     ws = wb[wb.sheetnames[sheet_index]]
+
+    # 指定シートがレイアウト的に売上明細でなければ自動検出にフォールバック
+    if _score_sales_sheet(ws) < 5:
+        wb.close()
+        detected = detect_sales_sheet_index(excel_path)
+        if detected is None or detected == sheet_index:
+            print(f"  警告: 指定シートに生徒データが見つかりません (index={sheet_index}): {excel_path}")
+            return {}
+        print(f"  情報: index={sheet_index} は不一致、自動検出 index={detected} ({detected!r}) を使用")
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[detected]]
 
     result = {}
     for row in ws.iter_rows(min_row=5, max_row=ws.max_row, values_only=False):
