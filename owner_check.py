@@ -94,6 +94,21 @@ BRAND_COLUMN_MAP = {
     "アン将棋クラブ": ("U", "V"),
 }
 
+# 既定値（小幡レイアウトをバックアップとして保存）
+_DEFAULT_BRAND_COLUMN_MAP = dict(BRAND_COLUMN_MAP)
+
+# シート内のグループ見出し名 → CSVブランド名 の対応。
+# 校舎ごとに異なる呼称を吸収する（筆っこ/美文字 など同一ブランドの別名もここで統一）。
+GROUP_LABEL_TO_CSV_BRAND = {
+    "プログラミング": "アンプログラミングクラブ",
+    "アン": "アンイングリッシュクラブ",
+    "そろばん": "アンそろばんクラブ",
+    "筆っこ": "アン美文字クラブ",
+    "美文字": "アン美文字クラブ",
+    "将棋": "アン将棋クラブ",
+    # 学童 は CSVブランドに対応がないため学習塾扱い
+}
+
 COL_DISPLAY = {
     "D": "設備費",
     "E": "授業料(学習塾)",
@@ -641,6 +656,221 @@ def detect_sales_sheet_index(excel_path: str) -> int | None:
         wb.close()
 
 
+def _normalize_label(s) -> str:
+    if s is None:
+        return ""
+    return str(s).replace("\u3000", "").replace(" ", "").replace("\n", "").strip()
+
+
+def detect_column_layout(excel_path: str, sheet_index: int) -> dict:
+    """
+    売上明細のヘッダ行（3行目=ブランド見出し, 4行目=項目名）を解析し、
+    校舎ごとの列マッピングを動的に構築する。
+
+    戻り値: {
+        "col_display": {letter: "授業料(アン)" ...},
+        "brand_column_map": {"アンイングリッシュクラブ": ("L","M"), ...},
+        "koshukai_cols": set(),
+        "recurring_cols": set(),
+    }
+    検出失敗時は空dict。
+    """
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.load_workbook(excel_path, read_only=False, data_only=True)
+    try:
+        if sheet_index < 0 or sheet_index >= len(wb.sheetnames):
+            return {}
+        ws = wb[wb.sheetnames[sheet_index]]
+        max_col = 40
+
+        # ヘッダ行（"生徒ID" を含むセルが属する行）を検出
+        header_row = None
+        for r in range(1, 10):
+            for c in range(1, 6):
+                v = ws.cell(row=r, column=c).value
+                if v and "生徒ID" in _normalize_label(v):
+                    header_row = r
+                    break
+            if header_row:
+                break
+        if not header_row or header_row < 2:
+            return {}
+        group_row = header_row - 1
+
+        # 行4（項目名）と行3（ブランド見出し）を収集
+        item_labels = {}
+        for c in range(1, max_col + 1):
+            v = ws.cell(row=header_row, column=c).value
+            lbl = _normalize_label(v)
+            if lbl:
+                item_labels[c] = lbl
+        group_labels = {}
+        for c in range(1, max_col + 1):
+            v = ws.cell(row=group_row, column=c).value
+            lbl = _normalize_label(v)
+            if lbl:
+                group_labels[c] = lbl
+
+        # 隣接する単一文字見出しを結合（例: 白鳳 L3="ア" + M3="ン" → "アン"）
+        merged_groups = {}
+        sorted_gcols = sorted(group_labels.keys())
+        i = 0
+        while i < len(sorted_gcols):
+            c = sorted_gcols[i]
+            label = group_labels[c]
+            j = i + 1
+            # 隣接連続で、全部1文字なら結合
+            while (j < len(sorted_gcols)
+                   and sorted_gcols[j] == sorted_gcols[j - 1] + 1
+                   and len(group_labels[sorted_gcols[j]]) == 1
+                   and len(label) <= 3):
+                label += group_labels[sorted_gcols[j]]
+                j += 1
+            merged_groups[c] = label
+            i = j
+
+        # 授業料位置 = 新ブランドの開始
+        tuition_cols = sorted([c for c, lbl in item_labels.items() if lbl == "授業料"])
+        if not tuition_cols:
+            return {}
+
+        # 各授業料列に対応するブランド名を同定
+        brand_at = {}
+        used_group_cols = set()
+        for tc in tuition_cols:
+            # 候補: tc → tc+1 → tc-1 の順で merged_groups を探索
+            label = None
+            for offset in (0, 1, -1, 2):
+                cand = tc + offset
+                if cand in merged_groups and cand not in used_group_cols:
+                    label = merged_groups[cand]
+                    used_group_cols.add(cand)
+                    break
+            brand_at[tc] = label or f"Unknown_{get_column_letter(tc)}"
+
+        # ブランドごとの列範囲（授業料列から次の授業料列 - 1 まで）
+        TRAILING = {"入会金", "その他", "売上", "合計", "売上合計"}
+        ranges = []
+        for idx, start in enumerate(tuition_cols):
+            brand = brand_at[start]
+            if idx + 1 < len(tuition_cols):
+                end = tuition_cols[idx + 1] - 1
+            else:
+                end = max_col
+                for c in range(start, max_col + 1):
+                    if c in item_labels and item_labels[c] in TRAILING:
+                        end = c - 1
+                        break
+            ranges.append((start, end, brand))
+
+        # 前置スタンドアロン列（生徒氏名より後、最初の授業料列より前）
+        SKIP = {"No.", "生徒ID", "生徒氏名"}
+        col_display = {}
+        structured = {}  # letter -> (brand, item)
+
+        first_brand_col = tuition_cols[0]
+        for c in range(1, first_brand_col):
+            if c in item_labels and item_labels[c] not in SKIP:
+                letter = get_column_letter(c)
+                item = item_labels[c]
+                col_display[letter] = item
+                structured[letter] = ("_leading", item)
+
+        for start, end, brand in ranges:
+            for c in range(start, end + 1):
+                if c not in item_labels:
+                    continue
+                letter = get_column_letter(c)
+                item = item_labels[c]
+                col_display[letter] = f"{item}({brand})"
+                structured[letter] = (brand, item)
+
+        if ranges:
+            last_end = ranges[-1][1]
+            for c in range(last_end + 1, max_col + 1):
+                if c in item_labels:
+                    letter = get_column_letter(c)
+                    col_display[letter] = item_labels[c]
+                    structured[letter] = ("_trailing", item_labels[c])
+
+        return {
+            "col_display": col_display,
+            "structured": structured,
+            "header_row": header_row,
+        }
+    finally:
+        wb.close()
+
+
+# 正規レイアウト（小幡基準）: (brand, item) → canonical letter
+_CANONICAL_MAP = {
+    # 前置スタンドアロン
+    ("_leading", "設備費"): "D",
+    ("_leading", "空調費"): "D",
+    # 学習塾
+    ("学習塾", "授業料"): "E",
+    ("学習塾", "月会費"): "F",
+    ("学習塾", "テスト対策講習会費"): "G",
+    ("学習塾", "模試代"): "H",
+    ("学習塾", "講習会費"): "I",
+    # プログラミング
+    ("プログラミング", "授業料"): "J",
+    ("プログラミング", "月会費"): "K",
+    ("プログラミング", "講習会費"): "L",
+    # アン(英会話)
+    ("アン", "授業料"): "M",
+    ("アン", "月会費"): "N",
+    # そろばん
+    ("そろばん", "授業料"): "O",
+    ("そろばん", "月会費"): "P",
+    ("そろばん", "講習会費"): "Q",
+    # 筆っこ = アン美文字
+    ("筆っこ", "授業料"): "R",
+    ("筆っこ", "月会費"): "S",
+    ("筆っこ", "講習会費"): "T",
+    ("美文字", "授業料"): "R",
+    ("美文字", "月会費"): "S",
+    ("美文字", "講習会費"): "T",
+    # 将棋
+    ("将棋", "授業料"): "U",
+    ("将棋", "月会費"): "V",
+    ("将棋", "講習会費"): "W",
+    # 後置スタンドアロン
+    ("_trailing", "入会金"): "X",
+    ("_trailing", "その他"): "Y",
+    ("_trailing", "売上"): "Z",
+    ("_trailing", "売上合計"): "Z",
+}
+
+# 読み込み時に適用される現在の列リマップ（src_letter -> canonical_letter）
+# None なら恒等変換（既定の小幡レイアウト）
+_CURRENT_REMAP: dict[str, str] | None = None
+
+
+def build_canonical_remap(layout: dict) -> dict[str, str]:
+    """
+    detect_column_layout の結果から、校舎固有の列レターを
+    正規レイアウト(小幡基準)のレターへマッピングする辞書を返す。
+    学童など正規レイアウトに無いブランドの列は省かれる(= 削除)。
+    """
+    if not layout:
+        return {}
+    remap = {}
+    structured = layout.get("structured", {})
+    for src_letter, (brand, item) in structured.items():
+        dst = _CANONICAL_MAP.get((brand, item))
+        if dst:
+            remap[src_letter] = dst
+    return remap
+
+
+def set_current_remap(remap: dict[str, str] | None) -> None:
+    """read_excel_sales が次回以降適用する列リマップを設定する。"""
+    global _CURRENT_REMAP
+    _CURRENT_REMAP = remap if remap else None
+
+
 def read_excel_sales(
     excel_path: str,
     sheet_index: int | None = 2,
@@ -701,6 +931,16 @@ def read_excel_sales(
             val = parse_number(cell.value)
             if val != 0:
                 cols[letter] = val
+
+        # 正規レイアウトへの列リマップ適用（校舎別レイアウト差異を吸収）
+        if _CURRENT_REMAP:
+            remapped = {}
+            for src_letter, v in cols.items():
+                dst = _CURRENT_REMAP.get(src_letter)
+                if dst:
+                    remapped[dst] = remapped.get(dst, 0) + v
+                # リマップに無い列は破棄（学童等、正規レイアウトに存在しないブランド）
+            cols = remapped
 
         result[sid] = {"name": str(name), "cols": cols, "row": row[0].row}
 
@@ -879,9 +1119,12 @@ def _find_similar_billing(
 
 # 講習会費系の列
 KOSHUKAI_COLS = {"G", "I", "L", "Q", "T", "W"}
+_DEFAULT_KOSHUKAI_COLS = set(KOSHUKAI_COLS)
+_DEFAULT_COL_DISPLAY = None  # read_excel_sales 初回呼び出し前に埋める
 
 # 定期費用の列（差額請求チェック対象）
 RECURRING_COLS = {"D", "E", "F", "J", "K", "M", "N", "O", "P", "R", "S", "U", "V"}
+_DEFAULT_RECURRING_COLS = set(RECURRING_COLS)
 
 
 def _check_koshukai_alert(

@@ -51,6 +51,10 @@ from owner_check import (
     aggregate_csv_for_student,
     compare_student,
     COL_DISPLAY,
+    detect_column_layout,
+    build_canonical_remap,
+    set_current_remap,
+    detect_sales_sheet_index,
 )
 
 app = Flask(__name__)
@@ -465,13 +469,25 @@ def run_all_checks(
                         pair.year, pair.month,
                     )
 
+            # --- 校舎ごとのレイアウト自動検出+正規化 ---
+            effective_sheet_idx = school.sheet_index
+            if effective_sheet_idx is None or effective_sheet_idx < 0:
+                detected = detect_sales_sheet_index(pair.excel_path)
+                if detected is not None:
+                    effective_sheet_idx = detected
+                else:
+                    effective_sheet_idx = 2
+            layout = detect_column_layout(pair.excel_path, effective_sheet_idx)
+            remap = build_canonical_remap(layout) if layout else {}
+            set_current_remap(remap or None)
+
             results, summary = run_check_silent(
                 school_name=school.name,
                 month_label=pair.label,
                 csv_paths=csv_paths,
                 csv_paths_with_labels=csv_paths_with_labels,
                 excel_path=pair.excel_path,
-                sheet_index=school.sheet_index,
+                sheet_index=effective_sheet_idx,
                 school_brands=school_brands,
                 withdrawn_sids=withdrawn_sids,
                 pair_year=pair.year,
@@ -479,6 +495,8 @@ def run_all_checks(
                 all_class_sids=all_class_sids,
                 mid_month_withdrawals=mid_month_wd,
             )
+            # リマップをクリア（次回の校舎に引き継がないように）
+            set_current_remap(None)
             all_results.extend(results)
             all_summaries.append({
                 "school": school.name,
