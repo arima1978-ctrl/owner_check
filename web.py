@@ -1208,9 +1208,12 @@ def run():
     _cache["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _cache["selected_school"] = school or ""
     _cache["selected_month"] = month_str
-    if not results:
-        scope = f"{school or '全校舎'} {month_str or '全期間'}"
+    scope = f"{school or '全校舎'} {month_str or '全期間'}"
+    if not summaries:
         flash(f"照合対象が見つかりませんでした ({scope})。売上Excelと請求CSVの配置を確認してください。")
+    elif not results:
+        total = sum(s.get("total", 0) for s in summaries)
+        flash(f"照合完了 ({scope}): {total}人、差異なし ✅")
     return redirect(url_for("index"))
 
 
