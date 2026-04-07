@@ -986,12 +986,16 @@ UPLOAD_TEMPLATE = """
         <!-- 新校舎追加 -->
         <div class="section">
             <h3>新しい校舎を追加</h3>
-            <p class="desc">照合対象の校舎を追加します。売上フォルダが自動作成されます。</p>
+            <p class="desc">照合対象の校舎を追加します。売上フォルダが自動作成され、config.yamlに追記されます。</p>
             <form action="/upload/add_school" method="post">
                 <div class="form-inline">
                     <div class="form-row">
                         <label>校舎名:</label>
-                        <input type="text" name="school_name" placeholder="例: 千種" required>
+                        <input type="text" name="school_name" placeholder="例: 白鳳" required>
+                    </div>
+                    <div class="form-row">
+                        <label>キーワード:</label>
+                        <input type="text" name="school_keywords" placeholder="省略時は校舎名。複数はカンマ区切り (例: 白鳳,白鳳校)">
                     </div>
                     <button type="submit" class="btn btn-outline btn-sm">追加</button>
                 </div>
@@ -1264,9 +1268,13 @@ def upload_csv():
 @app.route("/upload/add_school", methods=["POST"])
 def add_school():
     school_name = request.form.get("school_name", "").strip()
+    keywords_raw = request.form.get("school_keywords", "").strip()
     if not school_name:
         flash("校舎名を入力してください")
         return redirect(url_for("upload_page"))
+
+    # キーワードはカンマ区切り、空なら校舎名1つ
+    keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()] or [school_name]
 
     config_path = str(Path(__file__).parent / "config.yaml")
     config = load_config(config_path)
@@ -1277,13 +1285,14 @@ def add_school():
             flash(f"校舎 '{school_name}' は既に登録されています")
             return redirect(url_for("upload_page"))
 
-    # config.yaml に追加
+    # config.yaml に追加 (excel_dir は UPLOAD_SALES_DIR ベース = 環境非依存)
+    excel_dir = str(UPLOAD_SALES_DIR / f"{school_name}売上")
     new_school = {
         "name": school_name,
-        "excel_dir": f"C:/Users/USER/Documents/{school_name}売上",
+        "excel_dir": excel_dir,
         "excel_pattern": "{name}売上明細書({year}.{month}).xlsm",
         "sheet_index": 2,
-        "school_keywords": [school_name],
+        "school_keywords": keywords,
     }
     config["schools"].append(new_school)
 
