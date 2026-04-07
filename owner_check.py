@@ -627,14 +627,46 @@ def _map_to_column(brand: str, category: str) -> str | None:
     return "Y"
 
 
+def _find_header_row(ws) -> int | None:
+    """ヘッダ行(生徒ID を含む最初の行)を検出。1〜8行目を探索。"""
+    for r in range(1, 9):
+        for c in range(1, 6):
+            v = ws.cell(row=r, column=c).value
+            if v and "生徒ID" in str(v):
+                return r
+    return None
+
+
 def _score_sales_sheet(ws) -> int:
-    """売上明細シートらしさを数える。行5以降で B列=数値ID かつ C列=氏名 の行数。"""
+    """
+    売上明細シートらしさを採点。要件:
+    1) 生徒ID を含むヘッダ行がある
+    2) ヘッダ行に 授業料/月会費/講習会費/月謝 等の金額列キーワードがある
+    3) ヘッダ行+1 以降で B列=数値ID & C列=氏名 の行を数える
+    金額キーワードが無ければ 0 (生徒マスターシート等を除外)。
+    """
+    header_row = _find_header_row(ws)
+    if header_row is None:
+        return 0
+
+    money_keywords = ("授業料", "月会費", "講習会費", "月謝", "講習代", "模試代", "入会金")
+    has_money = False
+    for c in range(1, 40):
+        v = ws.cell(row=header_row, column=c).value
+        if v:
+            vstr = str(v).replace("\n", "").replace(" ", "")
+            if any(kw in vstr for kw in money_keywords):
+                has_money = True
+                break
+    if not has_money:
+        return 0
+
     score = 0
-    max_scan = min(ws.max_row, 400)
-    for row in ws.iter_rows(min_row=5, max_row=max_scan, values_only=True):
-        if len(row) < 3:
-            continue
-        a_val, b_val, c_val = row[0], row[1], row[2]
+    max_scan = min(ws.max_row, 500)
+    for r in range(header_row + 1, max_scan + 1):
+        a_val = ws.cell(row=r, column=1).value
+        b_val = ws.cell(row=r, column=2).value
+        c_val = ws.cell(row=r, column=3).value
         if a_val is not None and isinstance(a_val, str) and "計" in a_val:
             break
         if isinstance(b_val, (int, float)) and isinstance(c_val, str) and c_val.strip():
@@ -660,6 +692,95 @@ def _normalize_label(s) -> str:
     if s is None:
         return ""
     return str(s).replace("\u3000", "").replace(" ", "").replace("\n", "").strip()
+
+
+# タイプB (丸一/北山/金屋) 用: 列名から直接 (brand, item) を取り出す
+_TYPE_B_ITEMS = ("授業料", "月会費", "講習会費", "テスト対策費", "模試代")
+_TYPE_B_BRAND_NORMALIZE = {
+    "塾": "学習塾",
+    "学習塾": "学習塾",
+    "プログラミング": "プログラミング",
+    "プロ": "プログラミング",
+    "アン": "アン",
+    "そろばん": "そろばん",
+    "筆っこ": "筆っこ",
+    "美文字": "美文字",
+    "将棋": "将棋",
+    "学童": "学童",
+}
+
+
+def _parse_type_b_label(clean: str):
+    """'将棋授業料','プログラミング月会費','塾月会費','講習会費テスト対策費' などを分解。
+    返り値: (brand, item) または None。brand が空なら item 単独扱いとして _leading/_trailing に分類。"""
+    if not clean:
+        return None
+    # 複合: "講習会費テスト対策費" → 学習塾の テスト対策講習会費
+    if "テスト対策" in clean and "講習会費" in clean:
+        return ("学習塾", "テスト対策講習会費")
+    for item in _TYPE_B_ITEMS:
+        if clean.endswith(item):
+            brand_part = clean[:-len(item)]
+            if not brand_part:
+                return ("", item)  # ブランド前置なし (タイプC の単独列)
+            brand_norm = _TYPE_B_BRAND_NORMALIZE.get(brand_part, brand_part)
+            return (brand_norm, item)
+    return None
+
+
+def _parse_type_b_header(item_labels: dict, header_row: int) -> dict:
+    """単一行ヘッダ形式(タイプB)を解析してレイアウト辞書を返す。
+    brand+item 埋め込みラベルが2つ以上見つかれば有効。"""
+    from openpyxl.utils import get_column_letter
+
+    structured = {}
+    col_display = {}
+    STANDALONE_LEADING = {"設備費", "空調費"}
+    STANDALONE_TRAILING = {"入会金", "その他", "その他割引", "成績優秀割引", "売上", "売上合計", "備考"}
+    SKIP = {"No.", "生徒ID", "生徒氏名", "Name", "学年", "コース①", "コース②", "備考"}
+
+    brand_hits = 0
+    for c, lbl in item_labels.items():
+        clean = lbl.replace("\n", "").replace(" ", "").replace("\u3000", "")
+        if clean in SKIP:
+            continue
+        letter = get_column_letter(c)
+        if clean in STANDALONE_LEADING:
+            structured[letter] = ("_leading", clean)
+            col_display[letter] = clean
+            continue
+        if clean in STANDALONE_TRAILING:
+            structured[letter] = ("_trailing", clean)
+            col_display[letter] = clean
+            continue
+        if clean == "模試代":
+            structured[letter] = ("学習塾", "模試代")
+            col_display[letter] = "模試代(学習塾)"
+            continue
+        if clean == "講習会費":
+            # タイプBでは単独の講習会費は学習塾扱い
+            structured[letter] = ("学習塾", "講習会費")
+            col_display[letter] = "講習会費(学習塾)"
+            continue
+        parsed = _parse_type_b_label(clean)
+        if parsed:
+            brand, item = parsed
+            if brand:
+                structured[letter] = (brand, item)
+                col_display[letter] = f"{item}({brand})"
+                brand_hits += 1
+            else:
+                structured[letter] = ("_trailing", item)
+                col_display[letter] = item
+
+    if brand_hits < 2:
+        return {}  # タイプB と認められない
+
+    return {
+        "col_display": col_display,
+        "structured": structured,
+        "header_row": header_row,
+    }
 
 
 def detect_column_layout(excel_path: str, sheet_index: int) -> dict:
@@ -732,7 +853,13 @@ def detect_column_layout(excel_path: str, sheet_index: int) -> dict:
 
         # 授業料位置 = 新ブランドの開始
         tuition_cols = sorted([c for c, lbl in item_labels.items() if lbl == "授業料"])
+
+        # タイプA (二行ヘッダ) で授業料列が見つからない場合、
+        # タイプB (単一行ヘッダ、列名に「ブランド+項目」を埋め込み) を試す
         if not tuition_cols:
+            layout_b = _parse_type_b_header(item_labels, header_row)
+            if layout_b:
+                return layout_b
             return {}
 
         # 各授業料列に対応するブランド名を同定
@@ -908,8 +1035,12 @@ def read_excel_sales(
         wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
         ws = wb[wb.sheetnames[detected]]
 
+    # ヘッダ行を動的検出してデータ開始行を決定
+    header_row_detected = _find_header_row(ws)
+    data_start = (header_row_detected + 1) if header_row_detected else 5
+
     result = {}
-    for row in ws.iter_rows(min_row=5, max_row=ws.max_row, values_only=False):
+    for row in ws.iter_rows(min_row=data_start, max_row=ws.max_row, values_only=False):
         a_val = row[0].value
         if a_val is not None and isinstance(a_val, str) and "計" in a_val:
             break
