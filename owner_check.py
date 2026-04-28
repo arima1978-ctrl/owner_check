@@ -1040,7 +1040,7 @@ def read_excel_sales(
     data_start = (header_row_detected + 1) if header_row_detected else 5
 
     result = {}
-    for row in ws.iter_rows(min_row=data_start, max_row=ws.max_row, values_only=False):
+    for row_idx, row in enumerate(ws.iter_rows(min_row=data_start, max_row=ws.max_row, values_only=False), start=data_start):
         a_val = row[0].value
         if a_val is not None and isinstance(a_val, str) and "計" in a_val:
             break
@@ -1073,7 +1073,7 @@ def read_excel_sales(
                 # リマップに無い列は破棄（学童等、正規レイアウトに存在しないブランド）
             cols = remapped
 
-        result[sid] = {"name": str(name), "cols": cols, "row": row[0].row}
+        result[sid] = {"name": str(name), "cols": cols, "row": row_idx}
 
     wb.close()
     return result
