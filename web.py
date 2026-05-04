@@ -58,7 +58,7 @@ from owner_check import (
 )
 
 app = Flask(__name__)
-app.secret_key = "owner_check_secret_key"
+app.secret_key = os.environ["FLASK_SECRET_KEY"]
 
 
 def _load_web_settings() -> dict:

@@ -4,3 +4,10 @@ data/
 venv/
 *.pyc
 config.yaml
+
+# secrets
+token.json
+service_account*.json
+*.key
+credentials.json
+.env
