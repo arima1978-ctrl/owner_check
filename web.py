@@ -76,6 +76,7 @@ def _load_web_settings() -> dict:
         "upload_sales_dir": Path(web_cfg.get("upload_sales_dir", "./data/schools")),
         "upload_csv_dir": Path(web_cfg.get("upload_csv_dir", "./data/csv")),
         "port": int(web_cfg.get("port", 3006)),
+        "bind_host": str(web_cfg.get("bind_host", "0.0.0.0")),
         "basic_auth": web_cfg.get("basic_auth"),
     }
 
@@ -84,6 +85,7 @@ _WEB_SETTINGS = _load_web_settings()
 UPLOAD_SALES_DIR = _WEB_SETTINGS["upload_sales_dir"]
 UPLOAD_CSV_DIR = _WEB_SETTINGS["upload_csv_dir"]
 WEB_PORT = _WEB_SETTINGS["port"]
+BIND_HOST: str = _WEB_SETTINGS["bind_host"]
 BASIC_AUTH: dict | None = _WEB_SETTINGS["basic_auth"]
 
 
@@ -1438,4 +1440,4 @@ if __name__ == "__main__":
     print(f"  社内LAN: http://<このPCのIP>:{WEB_PORT}")
     print("  停止: Ctrl+C")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=WEB_PORT, debug=False, load_dotenv=False)
+    app.run(host=BIND_HOST, port=WEB_PORT, debug=False, load_dotenv=False)
