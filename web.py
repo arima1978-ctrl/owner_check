@@ -15,8 +15,9 @@ from pathlib import Path
 
 from flask import (
     Flask, render_template_string, send_file, redirect,
-    url_for, request, flash,
+    url_for, request, flash, Response,
 )
+from werkzeug.security import check_password_hash
 
 from owner_check import (
     load_config,
@@ -75,6 +76,7 @@ def _load_web_settings() -> dict:
         "upload_sales_dir": Path(web_cfg.get("upload_sales_dir", "./data/schools")),
         "upload_csv_dir": Path(web_cfg.get("upload_csv_dir", "./data/csv")),
         "port": int(web_cfg.get("port", 3006)),
+        "basic_auth": web_cfg.get("basic_auth"),
     }
 
 
@@ -82,6 +84,27 @@ _WEB_SETTINGS = _load_web_settings()
 UPLOAD_SALES_DIR = _WEB_SETTINGS["upload_sales_dir"]
 UPLOAD_CSV_DIR = _WEB_SETTINGS["upload_csv_dir"]
 WEB_PORT = _WEB_SETTINGS["port"]
+BASIC_AUTH: dict | None = _WEB_SETTINGS["basic_auth"]
+
+
+@app.before_request
+def _require_basic_auth() -> Response | None:
+    if not BASIC_AUTH:
+        return None
+    auth = request.authorization
+    expected_user = BASIC_AUTH.get("username", "")
+    expected_hash = BASIC_AUTH.get("password_hash", "")
+    if (
+        auth is None
+        or auth.username != expected_user
+        or not check_password_hash(expected_hash, auth.password or "")
+    ):
+        return Response(
+            "認証が必要です。",
+            401,
+            {"WWW-Authenticate": 'Basic realm="owner_check"'},
+        )
+    return None
 
 
 # ====================================================================
