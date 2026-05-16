@@ -503,6 +503,14 @@ def run_all_checks(
                 else:
                     effective_sheet_idx = 2
             layout = detect_column_layout(pair.excel_path, effective_sheet_idx)
+            # 指定シートに売上明細ヘッダが無ければ自動検出にフォールバック。
+            # 白鳳のように Excel 内のシート順が小幡と異なる校舎で、
+            # detect_column_layout が空 → リマップ無効 → 列ズレ表示、を防ぐ。
+            if not layout:
+                detected = detect_sales_sheet_index(pair.excel_path)
+                if detected is not None and detected != effective_sheet_idx:
+                    effective_sheet_idx = detected
+                    layout = detect_column_layout(pair.excel_path, effective_sheet_idx)
             remap = build_canonical_remap(layout) if layout else {}
             set_current_remap(remap or None)
 
